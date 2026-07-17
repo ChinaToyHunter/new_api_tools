@@ -131,12 +131,16 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 	//   - type=2 with completion_tokens = 0 → empty response (likely failure)
 	//   - type=5 → explicit failure (if NewAPI version supports it)
 	// This ensures correct success rate even when NewAPI doesn't log type=5 failures.
+	//
+	// IMPORTANT: the empty-response sum alias must be `empty_count`, not `empty`.
+	// `empty` is reserved in MySQL 8.x and causes ERROR 1064, which previously
+	// was swallowed and made every model report total_requests=0.
 	slotQuery := s.logDB.RebindQuery(fmt.Sprintf(`
 		SELECT FLOOR((created_at - %d) / %d) as slot_idx,
 			COUNT(*) as total,
 			SUM(CASE WHEN type = 2 AND completion_tokens > 0 THEN 1 ELSE 0 END) as success,
 			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure,
-			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty
+			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty_count
 		FROM logs
 		WHERE model_name = ?
 			AND created_at >= ? AND created_at < ?
@@ -145,7 +149,10 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		startTime, slotSeconds,
 		startTime, slotSeconds))
 
-	rows, _ := s.logDB.Query(slotQuery, modelName, startTime, now)
+	rows, err := s.logDB.Query(slotQuery, modelName, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("model status slot query failed for %s: %w", modelName, err)
+	}
 
 	// Initialize all slots with zeros
 	type slotInfo struct {
@@ -157,16 +164,14 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 	slotMap := make(map[int64]*slotInfo, numSlots)
 
 	// Fill in actual data from query results
-	if rows != nil {
-		for _, row := range rows {
-			idx := toInt64(row["slot_idx"])
-			if idx >= 0 && idx < int64(numSlots) {
-				slotMap[idx] = &slotInfo{
-					total:   toInt64(row["total"]),
-					success: toInt64(row["success"]),
-					failure: toInt64(row["failure"]),
-					empty:   toInt64(row["empty"]),
-				}
+	for _, row := range rows {
+		idx := toInt64(row["slot_idx"])
+		if idx >= 0 && idx < int64(numSlots) {
+			slotMap[idx] = &slotInfo{
+				total:   toInt64(row["total"]),
+				success: toInt64(row["success"]),
+				failure: toInt64(row["failure"]),
+				empty:   toInt64(row["empty_count"]),
 			}
 		}
 	}
