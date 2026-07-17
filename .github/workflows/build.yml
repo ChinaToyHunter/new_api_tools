@@ -27,7 +27,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # GHCR requires a lowercase repository name; ${{ github.repository }} keeps the
+  # owner's original casing (ChinaToyHunter), which fails buildx push. Hardcode lowercase.
+  IMAGE_NAME: chinatoyhunter/new_api_tools
 
 jobs:
   build:
