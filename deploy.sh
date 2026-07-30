@@ -90,6 +90,8 @@ extract_dsn_engine() {
     echo "postgres"
   elif [[ "$dsn" =~ ^mysql:// ]]; then
     echo "mysql"
+  elif [[ "$dsn" =~ ^clickhouse:// ]]; then
+    echo "clickhouse"
   fi
 }
 
@@ -561,7 +563,18 @@ detect_log_database() {
   pass="$(extract_dsn_password "$raw" || true)"
   db="$(extract_dsn_dbname "$raw" || true)"
   [[ -n "$host" && -n "$db" ]] || { log_warn "无法解析 LOG_SQL_DSN（host/dbname 缺失），跳过日志库配置"; return 0; }
-  if [[ "$engine" == "mysql" ]]; then port="${port:-3306}"; else engine="postgres"; port="${port:-5432}"; fi
+  case "$engine" in
+    mysql)
+      port="${port:-3306}"
+      ;;
+    clickhouse)
+      port="${port:-9000}"
+      ;;
+    *)
+      engine="postgres"
+      port="${port:-5432}"
+      ;;
+  esac
 
   # 与主库同款的连接方式改写
   if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "::1" ]]; then
@@ -591,11 +604,17 @@ detect_log_database() {
     log_info "日志库地址为主机名/外部地址，原样使用: ${host}"
   fi
 
-  if [[ "$engine" == "mysql" ]]; then
-    LOG_SQL_DSN_FINAL="${user}:${pass}@tcp(${host}:${port})/${db}?charset=utf8mb4&parseTime=True"
-  else
-    LOG_SQL_DSN_FINAL="host=${host} port=${port} user=${user} password=${pass} dbname=${db} sslmode=disable"
-  fi
+  case "$engine" in
+    mysql)
+      LOG_SQL_DSN_FINAL="${user}:${pass}@tcp(${host}:${port})/${db}?charset=utf8mb4&parseTime=True"
+      ;;
+    clickhouse)
+      LOG_SQL_DSN_FINAL="clickhouse://${user}:${pass}@${host}:${port}/${db}"
+      ;;
+    *)
+      LOG_SQL_DSN_FINAL="host=${host} port=${port} user=${user} password=${pass} dbname=${db} sslmode=disable"
+      ;;
+  esac
 
   # 日志库网络与主库不同时，追加日志叠加层并接入网络（相同则工具已在该网络上）
   if [[ -n "$LOG_NETWORK" && "$LOG_NETWORK" != "${NEWAPI_NETWORK:-}" ]]; then
@@ -757,56 +776,171 @@ check_compose_file() {
 }
 
 #######################################
-# 下载 GeoIP 数据库
+# 安全下载单个 GeoIP 文件（带总超时 / 体积上限 / 校验）
+# 解决：镜像挂起或返回异常流时 curl 无限写入占满磁盘（#26）
+# 参数: $1=目标路径  $2=最小字节  $3=最大字节  $4...=URL 列表
+#######################################
+download_geoip_file() {
+  local dest="$1"
+  local min_bytes="$2"
+  local max_bytes="$3"
+  shift 3
+  local urls=("$@")
+  local tmp="${dest}.tmp.$$"
+  local url size head
+
+  for url in "${urls[@]}"; do
+    rm -f "$tmp"
+    # --fail: HTTP 非 2xx 失败；--max-time: 整次传输超时；--max-filesize: 硬体积上限
+    # 可选步骤：短超时，避免国内机器连不上 GitHub 时拖垮部署（#25）
+    if ! curl -fsSL \
+        --connect-timeout 8 \
+        --max-time 60 \
+        --max-filesize "$max_bytes" \
+        --retry 1 \
+        --retry-delay 1 \
+        -o "$tmp" \
+        "$url" 2>/dev/null; then
+      rm -f "$tmp"
+      continue
+    fi
+
+    size=$(stat -c%s "$tmp" 2>/dev/null || stat -f%z "$tmp" 2>/dev/null || echo 0)
+    if [[ -z "$size" || "$size" -lt "$min_bytes" || "$size" -gt "$max_bytes" ]]; then
+      rm -f "$tmp"
+      continue
+    fi
+
+    # 拒绝 HTML/文本错误页（正常 mmdb 为二进制）
+    head=$(head -c 16 "$tmp" 2>/dev/null || true)
+    if [[ "$head" == \<* || "$head" == version\ https://git-lfs* ]]; then
+      rm -f "$tmp"
+      continue
+    fi
+
+    mv -f "$tmp" "$dest"
+    return 0
+  done
+
+  rm -f "$tmp"
+  return 1
+}
+
+#######################################
+# GeoIP 文件是否已就绪
+#######################################
+geoip_files_ready() {
+  local geoip_dir="${1:-${SCRIPT_DIR}/data/geoip}"
+  local city_db="${geoip_dir}/GeoLite2-City.mmdb"
+  local asn_db="${geoip_dir}/GeoLite2-ASN.mmdb"
+  [[ -f "$city_db" && -f "$asn_db" ]] || return 1
+  local cs as
+  cs=$(stat -c%s "$city_db" 2>/dev/null || stat -f%z "$city_db" 2>/dev/null || echo 0)
+  as=$(stat -c%s "$asn_db" 2>/dev/null || stat -f%z "$asn_db" 2>/dev/null || echo 0)
+  [[ "$cs" -ge 1048576 && "$cs" -le 120000000 && "$as" -ge 1048576 && "$as" -le 50000000 ]]
+}
+
+#######################################
+# 下载 GeoIP 数据库（实际下载；失败不退出）
 #######################################
 download_geoip_database() {
   local geoip_dir="${SCRIPT_DIR}/data/geoip"
   local city_db="${geoip_dir}/GeoLite2-City.mmdb"
   local asn_db="${geoip_dir}/GeoLite2-ASN.mmdb"
 
-  # 如果数据库已存在，跳过下载
+  if geoip_files_ready "$geoip_dir"; then
+    log_success "GeoIP 数据库已存在，跳过下载"
+    return 0
+  fi
+  if [[ -f "$city_db" || -f "$asn_db" ]]; then
+    log_warn "已有 GeoIP 文件体积异常，重新下载"
+    rm -f "$city_db" "$asn_db"
+  fi
+
+  log_info "正在下载 GeoIP 数据库（约 70MB，需可访问 GitHub/镜像）..."
+  mkdir -p "$geoip_dir"
+
+  local city_urls=(
+    "https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb"
+    "https://cdn.jsdelivr.net/gh/adysec/IP_database@main/geolite/GeoLite2-City.mmdb"
+    "https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb"
+  )
+  local asn_urls=(
+    "https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-ASN.mmdb"
+    "https://cdn.jsdelivr.net/gh/adysec/IP_database@main/geolite/GeoLite2-ASN.mmdb"
+    "https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-ASN.mmdb"
+  )
+
+  if [[ ! -f "$city_db" ]]; then
+    log_info "下载 GeoLite2-City.mmdb..."
+    if download_geoip_file "$city_db" 1048576 100000000 "${city_urls[@]}"; then
+      log_success "GeoLite2-City.mmdb 下载完成"
+    else
+      log_warn "GeoLite2-City.mmdb 下载失败（短超时，不阻塞部署）"
+      rm -f "$city_db" "${city_db}.tmp"*
+    fi
+  fi
+
+  if [[ ! -f "$asn_db" ]]; then
+    log_info "下载 GeoLite2-ASN.mmdb..."
+    if download_geoip_file "$asn_db" 1048576 40000000 "${asn_urls[@]}"; then
+      log_success "GeoLite2-ASN.mmdb 下载完成"
+    else
+      log_warn "GeoLite2-ASN.mmdb 下载失败（短超时，不阻塞部署）"
+      rm -f "$asn_db" "${asn_db}.tmp"*
+    fi
+  fi
+
   if [[ -f "$city_db" && -f "$asn_db" ]]; then
+    log_success "GeoIP 数据库下载完成"
+  else
+    log_warn "GeoIP 未就绪：IP 地理定位不可用，其它功能不受影响。可稍后 DOWNLOAD_GEOIP=1 ./deploy.sh 或手动放入 data/geoip/"
+  fi
+  return 0
+}
+
+#######################################
+# 可选下载 GeoIP（#25）
+# DOWNLOAD_GEOIP=1 强制下载；=0 / SKIP_GEOIP_DOWNLOAD=1 跳过
+# 交互默认 [y/N] 跳过；非交互默认跳过
+#######################################
+maybe_download_geoip_database() {
+  local force="${1:-}"
+  local geoip_dir="${SCRIPT_DIR}/data/geoip"
+
+  if [[ "$force" != "force" ]] && geoip_files_ready "$geoip_dir"; then
     log_success "GeoIP 数据库已存在，跳过下载"
     return 0
   fi
 
-  log_info "正在下载 GeoIP 数据库..."
-  mkdir -p "$geoip_dir"
-
-  # 下载源（优先 GitHub 直链，备用国内镜像）
-  local base_url="https://raw.githubusercontent.com/adysec/IP_database/main/geolite"
-  local fallback_url="https://raw.gitmirror.com/adysec/IP_database/main/geolite"
-
-  # 下载 City 数据库
-  if [[ ! -f "$city_db" ]]; then
-    log_info "下载 GeoLite2-City.mmdb..."
-    if ! curl -sL --connect-timeout 15 -o "$city_db" "${base_url}/GeoLite2-City.mmdb" 2>/dev/null; then
-      log_warn "GitHub 下载失败，尝试国内镜像..."
-      curl -sL --connect-timeout 30 -o "$city_db" "${fallback_url}/GeoLite2-City.mmdb" 2>/dev/null || {
-        log_warn "GeoLite2-City.mmdb 下载失败，IP 地理位置功能可能不可用"
-        rm -f "$city_db"
-      }
+  local want=""
+  if [[ "$force" == "force" ]]; then
+    want="yes"
+  elif [[ "${DOWNLOAD_GEOIP:-}" =~ ^(1|true|yes|YES|True)$ ]]; then
+    want="yes"
+  elif [[ "${SKIP_GEOIP_DOWNLOAD:-}" =~ ^(1|true|yes|YES|True)$ || "${DOWNLOAD_GEOIP:-}" =~ ^(0|false|no|NO|False)$ ]]; then
+    want="no"
+  elif [[ -t 0 ]]; then
+    echo ""
+    log_info "GeoIP 数据库用于 IP 地理定位 / 跨城风控（约 70MB）"
+    log_info "国内云主机若无法访问 GitHub，下载会失败；跳过不影响核心功能"
+    read -r -p "是否现在下载 GeoIP 数据库? [y/N]: " confirm
+    if [[ "$confirm" =~ ^[yY]$ ]]; then
+      want="yes"
+    else
+      want="no"
     fi
-  fi
-
-  # 下载 ASN 数据库
-  if [[ ! -f "$asn_db" ]]; then
-    log_info "下载 GeoLite2-ASN.mmdb..."
-    if ! curl -sL --connect-timeout 15 -o "$asn_db" "${base_url}/GeoLite2-ASN.mmdb" 2>/dev/null; then
-      log_warn "GitHub 下载失败，尝试国内镜像..."
-      curl -sL --connect-timeout 30 -o "$asn_db" "${fallback_url}/GeoLite2-ASN.mmdb" 2>/dev/null || {
-        log_warn "GeoLite2-ASN.mmdb 下载失败，ASN 查询功能可能不可用"
-        rm -f "$asn_db"
-      }
-    fi
-  fi
-
-  # 检查下载结果
-  if [[ -f "$city_db" && -f "$asn_db" ]]; then
-    log_success "GeoIP 数据库下载完成"
   else
-    log_warn "部分 GeoIP 数据库下载失败，可稍后手动下载"
+    want="no"
   fi
+
+  if [[ "$want" != "yes" ]]; then
+    log_info "已跳过 GeoIP 下载（可选）。需要时: DOWNLOAD_GEOIP=1 ./deploy.sh"
+    mkdir -p "$geoip_dir" 2>/dev/null || true
+    return 0
+  fi
+
+  download_geoip_database
 }
 
 #######################################
@@ -815,8 +949,8 @@ download_geoip_database() {
 start_services() {
   log_info "启动服务..."
 
-  # 下载 GeoIP 数据库
-  download_geoip_database
+  # GeoIP 可选（#25）
+  maybe_download_geoip_database
 
   # 检查是否有旧容器
   if docker ps -a --format '{{.Names}}' | grep -qE '^newapi-tools$'; then
@@ -959,6 +1093,8 @@ NewAPI Middleware Tool - 一键部署脚本
   API_KEY            后端 API Key (默认: 交互式输入或自动生成)
   FRONTEND_PORT      前端端口 (默认: 1145)
   FRONTEND_BIND      前端端口绑定网卡 0.0.0.0/127.0.0.1 (默认: 交互式选择)
+  DOWNLOAD_GEOIP     是否下载 GeoIP（1=下载, 0=跳过；默认交互询问且默认跳过）
+  SKIP_GEOIP_DOWNLOAD  设为 1 时强制跳过 GeoIP 下载
 
 示例:
   # 基本部署
@@ -969,6 +1105,12 @@ NewAPI Middleware Tool - 一键部署脚本
 
   # 非交互式部署，用 nginx 反代模式
   ADMIN_PASSWORD=mypass API_KEY=mykey FRONTEND_BIND=127.0.0.1 ./deploy.sh
+
+  # 跳过 GeoIP（国内云主机推荐，部署不因外网失败而卡住）
+  DOWNLOAD_GEOIP=0 ./deploy.sh
+
+  # 明确下载 GeoIP
+  DOWNLOAD_GEOIP=1 ./deploy.sh
 EOF
 }
 
