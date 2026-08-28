@@ -114,8 +114,9 @@ services:
   # 启用方式：在 .env 设置 WATCHTOWER_HTTP_API_TOKEN 后
   # `docker compose --profile updater up -d`；无 profile 时 sidecar 不启动。
   watchtower:
-    # 固定 release tag，避免直接跟随 latest；升级 sidecar 时应先核对上游 changelog。
-    image: nickfedor/watchtower:v1.21.2
+    # 固定 release tag + digest（发布版 1.21.2 == latest，已在 GHCR 验证）。
+    # 注意：该 fork 只发布在 GHCR 的 nicholas-fedor/watchtower（无 v 前缀 tag）。
+    image: ghcr.io/nicholas-fedor/watchtower:1.21.2@sha256:3b8d2e3f0f6ff9295a5d634e4fdb7062e5e6602f71d89baa15cd4d39d22b5743
     container_name: newapi-tools-watchtower
     profiles: ["updater"]
     labels:
