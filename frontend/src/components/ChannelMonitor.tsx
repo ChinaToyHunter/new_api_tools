@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react'
 import { useToast } from './Toast'
 import { useAuth } from '../contexts/AuthContext'
-import { Server, Loader2, RefreshCw, AlertTriangle, CheckCircle2, XCircle, Wallet, Activity } from 'lucide-react'
+import { Server, Loader2, RefreshCw, AlertTriangle, CheckCircle2, XCircle, Wallet, Activity, ChevronDown } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
@@ -75,6 +75,44 @@ const CATEGORY_LABELS: Record<string, { label: string; color: string }> = {
   upstream: { label: '上游 5xx', color: 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-400' },
   quota: { label: '额度不足', color: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400' },
   other: { label: '其他', color: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-400' },
+}
+
+// 可折叠的区块卡片：点击标题栏展开/收起内容（默认展开）。
+function CollapsibleSection({
+  title,
+  icon,
+  className,
+  titleClassName,
+  contentClassName,
+  defaultOpen = true,
+  children,
+}: {
+  title: ReactNode
+  icon?: ReactNode
+  className?: string
+  titleClassName?: string
+  contentClassName?: string
+  defaultOpen?: boolean
+  children: ReactNode
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <Card className={className}>
+      <CardHeader
+        className={cn('pb-2 cursor-pointer select-none transition-colors hover:bg-muted/30', !open && 'pb-6')}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className={cn('text-base font-medium flex items-center gap-2', titleClassName)}>
+            {icon}
+            {title}
+          </CardTitle>
+          <ChevronDown className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', open && 'rotate-180')} />
+        </div>
+      </CardHeader>
+      {open && <CardContent className={contentClassName}>{children}</CardContent>}
+    </Card>
+  )
 }
 
 export function ChannelMonitor() {
@@ -194,32 +232,25 @@ export function ChannelMonitor() {
 
       {/* 单点模型预警 */}
       {singlePoint.length > 0 && (
-        <Card className="border-yellow-300/60 dark:border-yellow-800/60">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base font-medium flex items-center gap-2 text-yellow-700 dark:text-yellow-400">
-              <AlertTriangle className="w-4 h-4" />
-              单点风险模型（仅一个启用渠道支撑）
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-2">
-              {singlePoint.map((m) => (
-                <span key={`${m.group}-${m.model}`} className="inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-md bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-800" title={`分组 ${m.group} · 渠道 ${m.channel_name || m.channel_id}`}>
-                  <code className="font-mono">{m.model}</code>
-                  <span className="text-muted-foreground">→ {m.channel_name || `#${m.channel_id}`}</span>
-                </span>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
+        <CollapsibleSection
+          className="border-yellow-300/60 dark:border-yellow-800/60"
+          titleClassName="text-yellow-700 dark:text-yellow-400"
+          icon={<AlertTriangle className="w-4 h-4" />}
+          title="单点风险模型（仅一个启用渠道支撑）"
+        >
+          <div className="flex flex-wrap gap-2">
+            {singlePoint.map((m) => (
+              <span key={`${m.group}-${m.model}`} className="inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-md bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-800" title={`分组 ${m.group} · 渠道 ${m.channel_name || m.channel_id}`}>
+                <code className="font-mono">{m.model}</code>
+                <span className="text-muted-foreground">→ {m.channel_name || `#${m.channel_id}`}</span>
+              </span>
+            ))}
+          </div>
+        </CollapsibleSection>
       )}
 
       {/* 渠道表 */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base font-medium">渠道列表</CardTitle>
-        </CardHeader>
-        <CardContent className="p-0">
+      <CollapsibleSection title="渠道列表" contentClassName="p-0">
           {channels.length === 0 ? (
             <div className="py-16 text-center text-muted-foreground">
               <Server className="h-8 w-8 mx-auto mb-3 opacity-40" />
@@ -290,15 +321,10 @@ export function ChannelMonitor() {
               </Table>
             </div>
           )}
-        </CardContent>
-      </Card>
+      </CollapsibleSection>
 
       {/* 模型健康 */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base font-medium">模型健康（窗口期内）</CardTitle>
-        </CardHeader>
-        <CardContent className="p-0">
+      <CollapsibleSection title="模型健康（窗口期内）" contentClassName="p-0">
           {modelHealth.length === 0 ? (
             <div className="py-12 text-center text-muted-foreground text-sm">窗口期内暂无调用日志</div>
           ) : (
@@ -350,18 +376,13 @@ export function ChannelMonitor() {
               </Table>
             </div>
           )}
-        </CardContent>
-      </Card>
+      </CollapsibleSection>
 
       {/* 错误分析 */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base font-medium flex items-center gap-2">
-            <XCircle className="w-4 h-4 text-red-500" />
-            错误分析（最近 {errorAnalysis?.sampled || 0} 条错误样本）
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
+      <CollapsibleSection
+        icon={<XCircle className="w-4 h-4 text-red-500" />}
+        title={`错误分析（最近 ${errorAnalysis?.sampled || 0} 条错误样本）`}
+      >
           {!errorAnalysis || errorAnalysis.sampled === 0 ? (
             <div className="py-8 text-center text-muted-foreground text-sm">窗口期内没有错误日志 🎉</div>
           ) : (
@@ -407,8 +428,7 @@ export function ChannelMonitor() {
               </div>
             </div>
           )}
-        </CardContent>
-      </Card>
+      </CollapsibleSection>
     </div>
   )
 }
