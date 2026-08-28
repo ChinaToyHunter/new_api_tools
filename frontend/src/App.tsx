@@ -17,9 +17,10 @@ const AbuseBroadcast = lazy(() => import('./components/AbuseBroadcast').then(m =
 const ChannelMonitor = lazy(() => import('./components/ChannelMonitor').then(m => ({ default: m.ChannelMonitor })))
 const CheckinAnalytics = lazy(() => import('./components/CheckinAnalytics').then(m => ({ default: m.CheckinAnalytics })))
 const TaskLogs = lazy(() => import('./components/TaskLogs').then(m => ({ default: m.TaskLogs })))
+const Settings = lazy(() => import('./components/Settings').then(m => ({ default: m.Settings })))
 
 // Valid tabs
-const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'abuse-broadcast', 'ip-analysis', 'analytics', 'model-status', 'users', 'tokens', 'auto-group', 'redemptions', 'channels', 'checkins', 'task-logs']
+const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'abuse-broadcast', 'ip-analysis', 'analytics', 'model-status', 'users', 'tokens', 'auto-group', 'redemptions', 'channels', 'checkins', 'task-logs', 'settings']
 
 // 旧路径迁移：generator / history 现合并到 redemptions 内部 tab
 const legacyRedirects: Record<string, string> = {
@@ -185,6 +186,8 @@ function App() {
         return <CheckinAnalytics />
       case 'task-logs':
         return <TaskLogs />
+      case 'settings':
+        return <Settings />
       default:
         return <Dashboard />
     }

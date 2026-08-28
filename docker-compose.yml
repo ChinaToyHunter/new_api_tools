@@ -6,12 +6,19 @@
 #   3. 手动部署: 复制 .env.example 为 .env 并配置后运行 docker-compose up -d
 #
 # 更新方式:
-#   docker compose pull && docker compose down && docker compose up -d
+#   a) 面板"设置"页一键更新：在 .env 配置 WATCHTOWER_HTTP_API_TOKEN，
+#      然后以 updater profile 启动：docker compose --profile updater up -d
+#   b) 手动: docker compose pull && docker compose up -d
+#      （手动回滚：把 image 换成上一个 commit 的 sha tag 后 up -d）
 
 services:
   newapi-tools:
-    image: ghcr.io/james-6-23/new_api_tools:latest
+    image: ghcr.io/chinatoyhunter/new_api_tools:latest
     container_name: newapi-tools
+    labels:
+      # 只允许本项目的 scoped Watchtower 更新此容器；宿主机其他容器不会进入其扫描范围。
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.centurylinklabs.watchtower.scope=${WATCHTOWER_SCOPE:-newapi-tools}"
     ports:
       # FRONTEND_BIND 控制端口绑定的网卡：
       #   - 0.0.0.0（默认）：所有网卡可达，浏览器可直连 IP:1145
@@ -49,6 +56,11 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # NewAPI 连接
       - NEWAPI_BASEURL=${NEWAPI_BASEURL:-}
+      # 一键更新（watchtower sidecar，可选；不配 TOKEN 则设置页显示部署指引）
+      - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-}
+      - WATCHTOWER_API_URL=${WATCHTOWER_API_URL:-http://watchtower:8080}
+      - WATCHTOWER_IMAGE=${WATCHTOWER_IMAGE:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     volumes:
       - ./data:/app/data
     restart: unless-stopped
@@ -95,6 +107,41 @@ services:
       timeout: 3s
       retries: 3
       start_period: 2s
+
+  # 一键更新 sidecar（可选）：唯一持有 docker.sock 的服务。
+  # 默认关闭周期轮询，只暴露 HTTP API
+  # 供后端在"设置"页触发：POST /v1/check（查 digest）、POST /v1/update（拉新镜像重建容器）。
+  # 启用方式：在 .env 设置 WATCHTOWER_HTTP_API_TOKEN 后
+  # `docker compose --profile updater up -d`；无 profile 时 sidecar 不启动。
+  watchtower:
+    # 固定 release tag，避免直接跟随 latest；升级 sidecar 时应先核对上游 changelog。
+    image: nickfedor/watchtower:v1.21.2
+    container_name: newapi-tools-watchtower
+    profiles: ["updater"]
+    labels:
+      # scoped Watchtower 实例自身也必须带相同 scope，避免与宿主机其他实例冲突。
+      - "com.centurylinklabs.watchtower.scope=${WATCHTOWER_SCOPE:-newapi-tools}"
+    environment:
+      - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-}
+      # 只启用 HTTP API 端点；禁用定时轮询（由设置页手动触发）。
+      - WATCHTOWER_HTTP_API_PERIODIC_POLLS=false
+      - WATCHTOWER_HTTP_API_ENDPOINTS=update,check
+      - WATCHTOWER_HTTP_API_CHECK_TIMEOUT=5m
+      - WATCHTOWER_HTTP_API_UPDATE_TIMEOUT=5m
+      # scope + enable 标签双重收口：仅扫描上方 newapi-tools 容器。
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_SCOPE=${WATCHTOWER_SCOPE:-newapi-tools}
+      - TZ=${TIMEZONE:-Asia/Shanghai}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - default
 
 networks:
   default:

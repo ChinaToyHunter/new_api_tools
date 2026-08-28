@@ -64,6 +64,14 @@ type Config struct {
 
 	// LinuxDo Lookup proxy (optional, e.g. socks5://user:pass@host:port)
 	LinuxDoProxyURL string `json:"linuxdo_proxy_url"`
+
+	// One-click update (Watchtower HTTP API sidecar, optional)
+	WatchtowerToken string `json:"-"`
+	// WatchtowerAPIURL is deployment-only configuration. Keep it out of any
+	// future config serialization because it describes a privileged sidecar.
+	WatchtowerAPIURL string `json:"-"`
+	WatchtowerImage  string `json:"watchtower_image"`
+	GitHubToken      string `json:"-"`
 }
 
 // Global config instance
@@ -108,6 +116,12 @@ func Load() *Config {
 
 		// LinuxDo proxy
 		LinuxDoProxyURL: getEnvStrMulti([]string{"LINUXDO_PROXY_URL", "LINUXDO_PROXY"}, ""),
+
+		// One-click update (watchtower sidecar)
+		WatchtowerToken:  getEnvStr("WATCHTOWER_HTTP_API_TOKEN", ""),
+		WatchtowerAPIURL: getEnvStr("WATCHTOWER_API_URL", "http://watchtower:8080"),
+		WatchtowerImage:  getEnvStr("WATCHTOWER_IMAGE", ""),
+		GitHubToken:      getEnvStr("GITHUB_TOKEN", ""),
 	}
 
 	// ======== Backward compatibility: build SQL_DSN from split fields ========

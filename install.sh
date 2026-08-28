@@ -5,7 +5,7 @@ set -euo pipefail
 # NewAPI Middleware Tool - 快速安装脚本
 #
 # 用法:
-#   bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+#   bash <(curl -sSL https://raw.githubusercontent.com/ChinaToyHunter/new_api_tools/main/install.sh)
 #
 # 功能:
 #   1. 自动检测 NewAPI 安装目录
@@ -27,13 +27,38 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { log_error "$*"; exit 1; }
 
-REPO_URL="https://github.com/james-6-23/new_api_tools.git"
+REPO_URL="https://github.com/ChinaToyHunter/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
 REINSTALL=false
 
 #######################################
-# 根据 .env 中的 NEWAPI_NETWORK 检测 host 模式，
-# 设置 COMPOSE_FILE 让所有后续 docker compose 调用自动叠加 host overlay。
+# 将官方上游旧安装迁移到本 fork；自定义 origin 保留不动。
+#######################################
+ensure_fork_origin() {
+  [[ -d ".git" ]] || return 0
+
+  local current_origin
+  current_origin=$(git remote get-url origin 2>/dev/null || true)
+  case "$current_origin" in
+    "")
+      git remote add origin "$REPO_URL"
+      log_info "已添加 fork 仓库 origin"
+      ;;
+    https://github.com/james-6-23/new_api_tools.git|https://github.com/james-6-23/new_api_tools|git@github.com:james-6-23/new_api_tools.git|ssh://git@github.com/james-6-23/new_api_tools.git)
+      git remote set-url origin "$REPO_URL"
+      log_info "已将旧上游 origin 迁移到 ChinaToyHunter fork"
+      ;;
+    https://github.com/ChinaToyHunter/new_api_tools.git|https://github.com/ChinaToyHunter/new_api_tools|git@github.com:ChinaToyHunter/new_api_tools.git|ssh://git@github.com/ChinaToyHunter/new_api_tools.git)
+      ;;
+    *)
+      log_warn "检测到自定义 Git origin，保留不变: $current_origin"
+      ;;
+  esac
+}
+
+#######################################
+# 根据 .env 中的 NEWAPI_NETWORK 检测 host 模式，并在 updater token
+# 非空时启用 updater profile；所有后续 docker compose 调用自动继承。
 # 在任何 $DOCKER_COMPOSE 调用前先调用本函数（通常 cd 到 project_dir 之后）。
 #######################################
 setup_compose_files() {
@@ -43,9 +68,17 @@ setup_compose_files() {
   local host_overlay="${project_dir}/docker-compose.host.yml"
   local host_loopback_overlay="${project_dir}/docker-compose.host-loopback.yml"
 
-  unset COMPOSE_FILE
+  unset COMPOSE_FILE COMPOSE_PROFILES
 
   [[ -f "$env_file" ]] || return 0
+
+  # token 非空时让 pull/up/down/restart 等命令都包含 Watchtower sidecar。
+  # 用户保留空值即表示显式禁用一键更新，其余服务照常运行。
+  local updater_token
+  updater_token=$(grep -E '^WATCHTOWER_HTTP_API_TOKEN=' "$env_file" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '\r\n' || true)
+  if [[ -n "$updater_token" ]]; then
+    export COMPOSE_PROFILES=updater
+  fi
 
   # 必须显式存在 NEWAPI_NETWORK 行才判断；行缺失视为老版 .env，让 base compose 走默认 fallback
   # 注意：set -e + pipefail 下，grep 无匹配会让 pipe 退出码为 1 → 整个脚本死掉，必须 || true 兜底。
@@ -77,11 +110,11 @@ cleanup_project_docker_resources() {
   log_info "清理 newapi-tools 残留 Docker 资源..."
 
   docker ps -a --format '{{.Names}}' \
-    | grep -E '^(newapi-tools|newapi-tools-redis|newapi-tools-backend|newapi-tools-frontend)$' \
+    | grep -E '^(newapi-tools|newapi-tools-redis|newapi-tools-watchtower|newapi-tools-backend|newapi-tools-frontend)$' \
     | xargs -r docker rm -f 2>/dev/null || true
 
   docker images --format '{{.Repository}}:{{.Tag}}' \
-    | grep -E '^(ghcr\.io/james-6-23/new_api_tools|new_api_tools|newapi-tools|newapi-tools-backend|newapi-tools-frontend)(:|$)' \
+    | grep -E '^(ghcr\.io/(james-6-23|chinatoyhunter)/new_api_tools|new_api_tools|newapi-tools|newapi-tools-backend|newapi-tools-frontend)(:|$)' \
     | xargs -r docker rmi -f 2>/dev/null || true
 
   docker network rm newapi-tools-network new_api_tools_default 2>/dev/null || true
@@ -732,6 +765,7 @@ do_update_interactive() {
 
   # 更新代码
   if [[ -d ".git" ]]; then
+    ensure_fork_origin
     log_info "更新代码..."
     git fetch origin 2>/dev/null || true
     git reset --hard origin/main 2>/dev/null || log_warn "代码更新跳过"
@@ -888,8 +922,8 @@ do_purge_interactive() {
   echo -e "${RED}════════════════════════════════════════════════════════════${NC}"
   echo ""
   echo -e "${YELLOW}将永久删除以下 newapi-tools 自身的数据：${NC}"
-  echo "  • 容器: newapi-tools / newapi-tools-redis"
-  echo "  • 镜像: ghcr.io/james-6-23/new_api_tools:*"
+  echo "  • 容器: newapi-tools / newapi-tools-redis / newapi-tools-watchtower"
+  echo "  • 镜像: ghcr.io/chinatoyhunter/new_api_tools:*（并清理兼容的旧上游镜像）"
   echo "  • Redis 缓存卷 (仪表盘 / 模型状态 / 等缓存)"
   echo "  • Docker 网络: newapi-tools-network (若存在)"
   echo "  • 配置文件 .env (含登录密码)"
@@ -911,6 +945,7 @@ do_purge_interactive() {
   log_warn "正在完全卸载..."
 
   # 停止并删除容器和 volumes
+  setup_compose_files "$project_dir"
   $DOCKER_COMPOSE down -v 2>/dev/null || true
 
   # 删除相关镜像
@@ -969,6 +1004,7 @@ do_full_reinstall_interactive() {
 
   # 停止并删除容器和 volumes
   log_info "停止并删除容器..."
+  setup_compose_files "$project_dir"
   $DOCKER_COMPOSE down -v 2>/dev/null || true
 
   cleanup_project_docker_resources
@@ -1022,7 +1058,7 @@ perform_cleanup() {
 
   # 强制删除可能残留的容器
   local containers
-  containers=$(docker ps -a --format '{{.Names}}' | grep -E '^(newapi-tools-backend|newapi-tools-frontend)$' 2>/dev/null || true)
+  containers=$(docker ps -a --format '{{.Names}}' | grep -E '^(newapi-tools|newapi-tools-redis|newapi-tools-watchtower|newapi-tools-backend|newapi-tools-frontend)$' 2>/dev/null || true)
   if [[ -n "$containers" ]]; then
     echo "$containers" | xargs -r docker rm -f 2>/dev/null || true
     log_success "已删除相关容器"
@@ -1051,6 +1087,7 @@ clone_or_update_project() {
   if [[ -d "$target_dir" ]]; then
     log_info "项目已存在，正在更新..."
     cd "$target_dir"
+    ensure_fork_origin
     git fetch origin
     git reset --hard origin/main
     log_success "项目已更新到最新版本"
@@ -1262,8 +1299,8 @@ check_and_update_configs() {
 }
 
 #######################################
-# 迁移旧版 .env 文件 (从 Python 版升级到 Go 版)
-# 为旧用户自动补充 Go 版本所需的新字段
+# 迁移旧版 .env 文件（补齐当前版本新增字段）
+# 已存在的值一律保留；仅缺失的 updater token 会安全生成。
 #######################################
 migrate_env_file() {
   local project_dir="$1"
@@ -1316,8 +1353,35 @@ migrate_env_file() {
     migrated=true
   fi
 
+  # 旧部署升级时生成 updater token；空值仍视为用户显式禁用，不覆盖。
+  if ! grep -q '^WATCHTOWER_HTTP_API_TOKEN=' "$env_file" 2>/dev/null; then
+    local watchtower_token=""
+    if command -v openssl >/dev/null 2>&1; then
+      watchtower_token=$(openssl rand -hex 32 2>/dev/null || true)
+    fi
+    if [[ -z "$watchtower_token" && -r /dev/urandom ]]; then
+      watchtower_token=$(head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)
+    fi
+    if [[ -n "$watchtower_token" ]]; then
+      echo "WATCHTOWER_HTTP_API_TOKEN=${watchtower_token}" >> "$env_file"
+      migrated=true
+      log_info "已生成一键更新 sidecar 共享 token"
+    else
+      echo "WATCHTOWER_HTTP_API_TOKEN=" >> "$env_file"
+      migrated=true
+      log_warn "无法生成 updater token；一键更新保持禁用，可稍后手动配置"
+    fi
+  fi
+
+  if ! grep -q '^WATCHTOWER_SCOPE=' "$env_file" 2>/dev/null; then
+    echo "WATCHTOWER_SCOPE=newapi-tools" >> "$env_file"
+    migrated=true
+  fi
+
+  chmod 600 "$env_file" 2>/dev/null || true
+
   if [[ "$migrated" == "true" ]]; then
-    log_success "已自动补充 Go 版本所需的配置字段"
+    log_success "已自动补充当前版本所需的配置字段"
   fi
 }
 
@@ -1520,7 +1584,7 @@ NewAPI Middleware Tool - 安装管理脚本
   PROJECT_DIR      指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER 指定 NewAPI 容器名（默认: 自动检测）
 
-更多信息: https://github.com/james-6-23/new_api_tools
+更多信息: https://github.com/ChinaToyHunter/new_api_tools
 EOF
 }
 

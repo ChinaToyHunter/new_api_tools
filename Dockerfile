@@ -21,6 +21,9 @@ RUN npm run build
 # Stage 2: 构建 Go 后端
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS backend-builder
 ARG TARGETARCH
+# 构建时注入 git commit（CI 传完整 GITHUB_SHA；本地构建默认 dev），
+# 供设置页展示版本并与远端 main 比对实现"检查更新"
+ARG GIT_COMMIT=dev
 WORKDIR /build
 RUN apk add --no-cache git ca-certificates tzdata
 
@@ -34,7 +37,7 @@ COPY backend/ .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
-    -ldflags="-s -w" \
+    -ldflags="-s -w -X github.com/new-api-tools/backend/internal/version.GitCommit=${GIT_COMMIT}" \
     -o /build/server \
     ./cmd/server
 

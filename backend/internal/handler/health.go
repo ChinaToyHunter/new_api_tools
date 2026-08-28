@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/models"
+	"github.com/new-api-tools/backend/internal/version"
 )
 
 // RegisterHealthRoutes registers health check endpoints
@@ -14,12 +15,13 @@ func RegisterHealthRoutes(r *gin.Engine) {
 	r.GET("/api/health/db", DatabaseHealthCheck)
 }
 
-// HealthCheck handles GET /api/health
-// Matches Python: {"status": "healthy", "version": "0.1.0"}
+// HealthCheck handles GET /api/health.
+// Version is injected at build time and lets the update UI verify the new
+// container is actually serving after Watchtower recreates it.
 func HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, models.HealthResponse{
 		Status:  "healthy",
-		Version: "0.1.0",
+		Version: version.GitCommit,
 	})
 }
 

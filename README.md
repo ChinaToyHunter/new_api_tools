@@ -32,7 +32,8 @@
 | 前端栈 | React `19`、Vite `8`、TypeScript、Tailwind CSS、ECharts |
 | 数据库 | 生产优先 PostgreSQL / MySQL，查询字段以导出的真实 schema 为准 |
 | 部署入口 | `install.sh` 一键部署，或 `docker-compose.yml` 手动部署 |
-| 镜像 | `ghcr.io/james-6-23/new_api_tools:latest` |
+| 镜像 | `ghcr.io/chinatoyhunter/new_api_tools:latest` |
+| 更新 | 设置页检查版本并通过受限 Watchtower sidecar 一键更新；保留手动更新/回滚路径 |
 
 ## 能力速览
 
@@ -62,7 +63,7 @@
 如果 NewAPI 已部署在 Linux 服务器上，可以使用一键脚本自动检测环境并部署：
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/ChinaToyHunter/new_api_tools/main/install.sh)
 ```
 
 脚本会自动定位 NewAPI 安装目录、读取数据库配置、生成必要密钥、设置管理员密码、配置 Docker 网络并启动服务。部署完成后访问：
@@ -76,12 +77,37 @@ http://your-server-ip:1145
 适用于熟悉 Docker 的用户或非标准环境：
 
 ```bash
-git clone https://github.com/james-6-23/new_api_tools.git
+git clone https://github.com/ChinaToyHunter/new_api_tools.git
 cd new_api_tools
 cp .env.example .env
 vim .env
-docker-compose up -d
+docker compose up -d
 ```
+
+### 设置页一键更新（可选）
+
+设置页可显示当前构建 commit、检查远端镜像 digest，并触发仅更新
+`newapi-tools` 容器。该能力使用独立 Watchtower sidecar：应用容器不挂载
+`docker.sock`，sidecar 不映射公网端口，并用 scope + enable 标签限制扫描范围。
+
+`deploy.sh` 新部署会自动生成共享 token 并启动 updater profile。手动部署时：
+
+```bash
+TOKEN=$(openssl rand -hex 32)
+if grep -q '^WATCHTOWER_HTTP_API_TOKEN=' .env; then
+  sed -i "s|^WATCHTOWER_HTTP_API_TOKEN=.*|WATCHTOWER_HTTP_API_TOKEN=${TOKEN}|" .env
+else
+  printf '\nWATCHTOWER_HTTP_API_TOKEN=%s\n' "$TOKEN" >> .env
+fi
+chmod 600 .env
+
+docker compose --profile updater up -d
+```
+
+目标容器在后端固定为 `newapi-tools`，不能通过请求或环境变量改成宿主机上的其他容器。
+未配置 token/sidecar 时，其余功能完全不受影响，设置页只显示启用指引。若需回滚，
+将 compose 中应用镜像临时改为上一个 commit 的 SHA tag，再执行
+`docker compose up -d`；一键更新不会自动删除旧镜像。
 
 ### 日志分库（LOG_SQL_DSN）自动兼容
 
@@ -91,13 +117,13 @@ docker-compose up -d
 
 ```bash
 # 一键脚本已涵盖日志库；重新运行即可让已部署实例补上日志库连接
-bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/ChinaToyHunter/new_api_tools/main/install.sh)
 ```
 
 > 单独修复 / 不想整体重部署时，也可只跑日志库脚本：
 > ```bash
-> bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/setup-log-db.sh)         # 检测并配置
-> bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/setup-log-db.sh) --print # 仅预览，不改动
+> bash <(curl -sSL https://raw.githubusercontent.com/ChinaToyHunter/new_api_tools/main/setup-log-db.sh)         # 检测并配置
+> bash <(curl -sSL https://raw.githubusercontent.com/ChinaToyHunter/new_api_tools/main/setup-log-db.sh) --print # 仅预览，不改动
 > ```
 > 即使日志库一时连不上，后端也只会**降级为读主库**（日志暂时为空），不会崩溃。
 
@@ -113,6 +139,10 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 | `API_KEY` | 前后端内部 API Key | 部署脚本自动生成 |
 | `JWT_SECRET` | JWT 签名密钥 | 部署脚本自动生成 |
 | `JWT_EXPIRE_HOURS` | JWT 过期时间（小时） | `24` |
+| `WATCHTOWER_HTTP_API_TOKEN` | 一键更新 sidecar 共享 token；留空则禁用 | `openssl rand -hex 32` |
+| `WATCHTOWER_API_URL` | Watchtower 容器网络地址 | `http://watchtower:8080` |
+| `WATCHTOWER_SCOPE` | Watchtower 与目标容器共享的隔离 scope | `newapi-tools` |
+| `GITHUB_TOKEN` | 查询远端 commit 的可选 token（提高限流额度） | 可选 |
 | `SQL_DSN` | 推荐的完整数据库连接串 | `host=... port=5432 user=...` |
 | `LOG_SQL_DSN` | 日志专用库连接串（支持 MySQL、PostgreSQL 和 ClickHouse；留空则日志查询回落主库）。建议用 `setup-log-db.sh` 自动生成 | `clickhouse://user:pass@host:9000/logs` / 可选 |
 | `DB_ENGINE` | 兼容旧版分离配置的数据库类型 | `postgres` / `mysql` |
@@ -198,4 +228,4 @@ MIT License
 
 ## Star History
 
-[![Star History Chart](https://star-history.dera.page/svg?repos=james-6-23/new_api_tools&type=Date)](https://star-history.dera.page/#james-6-23/new_api_tools&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=ChinaToyHunter/new_api_tools&type=Date)](https://star-history.dera.page/#ChinaToyHunter/new_api_tools&Date)

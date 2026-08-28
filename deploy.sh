@@ -830,6 +830,10 @@ JWT_EXPIRE_HOURS=24
 
 # Redis 配置
 REDIS_PASSWORD=
+
+# 一键更新 (watchtower sidecar 共享 token；配合 `docker compose --profile updater up -d`)
+WATCHTOWER_HTTP_API_TOKEN=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p | tr -d '\n' | head -c 64)
+WATCHTOWER_SCOPE=newapi-tools
 EOF
 
   chmod 600 "$ENV_FILE"
@@ -1026,17 +1030,18 @@ start_services() {
   # 检查是否有旧容器
   if docker ps -a --format '{{.Names}}' | grep -qE '^newapi-tools$'; then
     log_warn "发现已存在的服务容器，正在停止..."
-    $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" down 2>/dev/null || true
+    $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" --profile updater down 2>/dev/null || true
   fi
-  # 回环代理容器可能属于上一次不同的 compose 组合，单独清理
-  docker rm -f newapi-tools-db-proxy 2>/dev/null || true
+  # profile/overlay 组合变化后可能遗留辅助容器，单独清理
+  docker rm -f newapi-tools-watchtower newapi-tools-db-proxy 2>/dev/null || true
 
-  # 拉取最新镜像
+  # 拉取最新镜像（含 updater profile 的 Watchtower sidecar）
   log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" pull
+  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" --profile updater pull
 
-  # 启动服务
-  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" up -d
+  # 启动服务和一键更新 sidecar。deploy.sh 会生成随机 token；旧环境若未配置
+  # token，应先按 .env.example 添加后再启用此 profile。
+  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" --profile updater up -d
 
   # 将容器连接到 NewAPI 网络（用于访问数据库）
   # 注意：docker-compose.yml 中也配置了网络，这里是双重保障
@@ -1120,8 +1125,8 @@ uninstall() {
   log_warn "正在卸载 NewAPI Middleware Tool..."
 
   if [[ -f "$COMPOSE_FILE" && -f "$ENV_FILE" ]]; then
-    $DOCKER_COMPOSE -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v 2>/dev/null || true
-    docker rm -f newapi-tools-db-proxy 2>/dev/null || true
+    $DOCKER_COMPOSE -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile updater down -v 2>/dev/null || true
+    docker rm -f newapi-tools-watchtower newapi-tools-db-proxy 2>/dev/null || true
     log_success "容器已停止并移除"
   fi
 

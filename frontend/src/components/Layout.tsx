@@ -9,7 +9,7 @@ import { cn } from '../lib/utils'
 import { useAuth } from '../contexts/AuthContext'
 import { apiFetch, createAuthHeaders } from '../lib/api'
 
-export type TabType = 'dashboard' | 'risk' | 'abuse-broadcast' | 'ip-analysis' | 'redemptions' | 'topups' | 'analytics' | 'model-status' | 'users' | 'auto-group' | 'tokens' | 'channels' | 'checkins' | 'task-logs'
+export type TabType = 'dashboard' | 'risk' | 'abuse-broadcast' | 'ip-analysis' | 'redemptions' | 'topups' | 'analytics' | 'model-status' | 'users' | 'auto-group' | 'tokens' | 'channels' | 'checkins' | 'task-logs' | 'settings'
 
 interface DbStatus {
   connected: boolean
@@ -40,6 +40,7 @@ const tabs: { id: TabType; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'tokens', label: '令牌管理', icon: Key },
   { id: 'auto-group', label: '自动分组', icon: UserPlus },
   { id: 'redemptions', label: '兑换码管理', icon: Ticket },
+  { id: 'settings', label: '设置', icon: Settings },
 ]
 
 // 功能项显隐配置（仪表板不可隐藏，作为兜底页）
