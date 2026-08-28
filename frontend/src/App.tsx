@@ -14,9 +14,12 @@ const ModelStatusMonitor = lazy(() => import('./components/ModelStatusMonitor').
 const AutoGroup = lazy(() => import('./components/AutoGroup').then(m => ({ default: m.AutoGroup })))
 const Tokens = lazy(() => import('./components/Tokens').then(m => ({ default: m.Tokens })))
 const AbuseBroadcast = lazy(() => import('./components/AbuseBroadcast').then(m => ({ default: m.AbuseBroadcast })))
+const ChannelMonitor = lazy(() => import('./components/ChannelMonitor').then(m => ({ default: m.ChannelMonitor })))
+const CheckinAnalytics = lazy(() => import('./components/CheckinAnalytics').then(m => ({ default: m.CheckinAnalytics })))
+const TaskLogs = lazy(() => import('./components/TaskLogs').then(m => ({ default: m.TaskLogs })))
 
 // Valid tabs
-const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'abuse-broadcast', 'ip-analysis', 'analytics', 'model-status', 'users', 'tokens', 'auto-group', 'redemptions']
+const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'abuse-broadcast', 'ip-analysis', 'analytics', 'model-status', 'users', 'tokens', 'auto-group', 'redemptions', 'channels', 'checkins', 'task-logs']
 
 // 旧路径迁移：generator / history 现合并到 redemptions 内部 tab
 const legacyRedirects: Record<string, string> = {
@@ -176,6 +179,12 @@ function App() {
         return <Tokens />
       case 'auto-group':
         return <AutoGroup />
+      case 'channels':
+        return <ChannelMonitor />
+      case 'checkins':
+        return <CheckinAnalytics />
+      case 'task-logs':
+        return <TaskLogs />
       default:
         return <Dashboard />
     }

@@ -62,6 +62,40 @@ interface PaginatedResponse {
 
 type StatusFilter = '' | 'pending' | 'success' | 'failed' | 'expired' | 'unknown'
 
+/** 纯数字 → user_id 精确查；否则 → username 模糊查 */
+function appendUserSearchParam(params: URLSearchParams, query: string) {
+  const q = query.trim()
+  if (!q) return
+  if (/^\d+$/.test(q)) {
+    params.append('user_id', q)
+  } else {
+    params.append('username', q)
+  }
+}
+
+/** 从用户搜索框解析精确 user_id（仅纯数字时返回） */
+function parseExactUserId(query: string): number | null {
+  const q = query.trim()
+  if (!/^\d+$/.test(q)) return null
+  const n = Number(q)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+interface UserQuotaIncomeSummary {
+  user_id: number
+  username: string
+  paid_count: number
+  paid_money: number
+  paid_amount: number
+  unsuccess_count: number
+  unsuccess_money: number
+  redemption_count: number
+  redemption_quota_raw: number
+  redemption_quota_usd: number
+  net_paid_amount_usd: number
+  total_income_usd: number
+}
+
 function getStatusLabel(status: string) {
   if (status === 'success') return '成功'
   if (status === 'pending') return '待处理'
@@ -102,6 +136,10 @@ export function TopUps() {
   const [endDate, setEndDate] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [userIncome, setUserIncome] = useState<UserQuotaIncomeSummary | null>(null)
+  const [userIncomeLoading, setUserIncomeLoading] = useState(false)
+
+  const exactUserId = parseExactUserId(usernameSearch)
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const getAuthHeaders = useCallback(() => ({
@@ -140,6 +178,31 @@ export function TopUps() {
     } finally { setStatsLoading(false) }
   }, [apiUrl, getAuthHeaders, startDate, endDate])
 
+  // 精确 user_id 筛选时拉取「实付 vs 兑换码」入账汇总
+  const fetchUserIncome = useCallback(async () => {
+    if (exactUserId == null) {
+      setUserIncome(null)
+      return
+    }
+    setUserIncomeLoading(true)
+    try {
+      const params = new URLSearchParams({ user_id: String(exactUserId) })
+      if (startDate) params.append('start_date', startDate)
+      if (endDate) params.append('end_date', endDate)
+      const response = await fetch(`${apiUrl}/api/top-ups/user-income-summary?${params.toString()}`, {
+        headers: getAuthHeaders(),
+      })
+      const data = await response.json()
+      if (data.success) setUserIncome(data.data)
+      else setUserIncome(null)
+    } catch (error) {
+      console.error('Failed to fetch user income summary:', error)
+      setUserIncome(null)
+    } finally {
+      setUserIncomeLoading(false)
+    }
+  }, [apiUrl, getAuthHeaders, exactUserId, startDate, endDate])
+
   const fetchRecords = useCallback(async () => {
     setLoading(true)
     try {
@@ -148,7 +211,7 @@ export function TopUps() {
       if (paymentMethodFilter) params.append('payment_method', paymentMethodFilter)
       if (paymentProviderFilter) params.append('payment_provider', paymentProviderFilter)
       if (tradeNoSearch) params.append('trade_no', tradeNoSearch)
-      if (usernameSearch) params.append('username', usernameSearch)
+      appendUserSearchParam(params, usernameSearch)
       if (startDate) params.append('start_date', startDate)
       if (endDate) params.append('end_date', endDate)
 
@@ -168,17 +231,18 @@ export function TopUps() {
 
   useEffect(() => { fetchRecords() }, [fetchRecords])
   useEffect(() => { fetchStatistics() }, [fetchStatistics])
+  useEffect(() => { fetchUserIncome() }, [fetchUserIncome])
   useEffect(() => { setPage(1) }, [statusFilter, paymentMethodFilter, paymentProviderFilter, tradeNoSearch, usernameSearch, startDate, endDate])
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    await Promise.all([fetchRecords(), fetchStatistics()])
+    await Promise.all([fetchRecords(), fetchStatistics(), fetchUserIncome()])
     setRefreshing(false)
     showToast('success', '数据已刷新')
   }
 
-  // 复用记录 tab 的过滤条件导出 CSV。fetch + blob 走 Authorization；
-  // 后端 400 EXPORT_TOO_LARGE 时响应是 JSON，需要按 content-type 分支处理。
+  // 复用记录 tab 的过滤条件导出 CSV。
+  // 当筛选为精确 user_id 时，后端导出含兑换码标注 + 剔除兑换后的统计摘要。
   const handleExport = async () => {
     if (exporting) return
     setExporting(true)
@@ -188,7 +252,7 @@ export function TopUps() {
       if (paymentMethodFilter) params.append('payment_method', paymentMethodFilter)
       if (paymentProviderFilter) params.append('payment_provider', paymentProviderFilter)
       if (tradeNoSearch) params.append('trade_no', tradeNoSearch)
-      if (usernameSearch) params.append('username', usernameSearch)
+      appendUserSearchParam(params, usernameSearch)
       if (startDate) params.append('start_date', startDate)
       if (endDate) params.append('end_date', endDate)
 
@@ -209,7 +273,9 @@ export function TopUps() {
 
       const blob = await response.blob()
       // 文件名优先取响应头里的，落空再用本地时间
-      let filename = `top_ups_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`
+      let filename = exactUserId != null
+        ? `user_${exactUserId}_quota_income_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`
+        : `top_ups_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`
       const cd = response.headers.get('Content-Disposition') || ''
       const match = cd.match(/filename="?([^"]+)"?/)
       if (match) filename = match[1]
@@ -222,7 +288,12 @@ export function TopUps() {
       a.click()
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
-      showToast('success', '导出已开始下载')
+      showToast(
+        'success',
+        exactUserId != null
+          ? '用户额度明细已导出（含兑换码标注，实付已剔除兑换）'
+          : '导出已开始下载',
+      )
     } catch (error) {
       console.error('Export failed:', error)
       showToast('error', '网络错误，导出失败')
@@ -241,16 +312,31 @@ export function TopUps() {
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
           <h2 className="text-3xl font-bold tracking-tight">充值记录</h2>
-          <p className="text-muted-foreground mt-1">查看所有用户的充值历史与状态</p>
+          <p className="text-muted-foreground mt-1">
+            查看充值历史 · 实付金额为用户实际支付，获得额度为入账额度
+          </p>
         </div>
         <div className="flex items-center gap-3 flex-wrap">
           <Button variant="outline" size="sm" onClick={handleRefresh} disabled={refreshing || loading} className="h-9">
             <RefreshCw className={cn("h-4 w-4 mr-2", refreshing && "animate-spin")} />
             刷新
           </Button>
-          <Button variant="outline" size="sm" onClick={handleExport} disabled={exporting} className="h-9" title="按当前筛选导出 CSV">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleExport}
+            disabled={exporting}
+            className="h-9"
+            title={exactUserId != null
+              ? '导出该用户充值+兑换码明细（CSV 标注类型，实付剔除兑换额度）'
+              : '按当前筛选导出 CSV；输入用户 ID 可导出含兑换码标注的用户明细'}
+          >
             {exporting ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Download className="h-4 w-4 mr-2" />}
-            {exporting ? '导出中...' : '导出 CSV'}
+            {exporting
+              ? '导出中...'
+              : exactUserId != null
+                ? '导出用户明细'
+                : '导出 CSV'}
           </Button>
           <Button variant="outline" size="sm" onClick={() => window.open('https://credit.linux.do/home', '_blank')} className="h-9">
             <ExternalLink className="h-4 w-4 mr-2" />
@@ -325,13 +411,13 @@ export function TopUps() {
                 <span className="text-muted-foreground">成功充值:</span>
                 <span className="font-semibold">{statsLoading ? '-' : statistics?.success_count || 0} 笔</span>
               </div>
-              <div className="flex items-center gap-2">
-                <span className="text-muted-foreground">实收金额:</span>
+              <div className="flex items-center gap-2" title="成功充值订单的用户实付金额合计">
+                <span className="text-muted-foreground">实付金额:</span>
                 <span className="font-semibold text-primary">{statsLoading ? '-' : formatMoney(statistics?.success_money || 0)}</span>
               </div>
-              <div className="flex items-center gap-2">
-                 <span className="text-muted-foreground">入账额度:</span>
-                 <span className="font-semibold">{statsLoading ? '-' : formatAmount(statistics?.success_amount || 0)} USD</span>
+              <div className="flex items-center gap-2" title="成功充值后用户获得的额度合计">
+                 <span className="text-muted-foreground">获得额度:</span>
+                 <span className="font-semibold text-green-600">{statsLoading ? '-' : formatAmount(statistics?.success_amount || 0)} USD</span>
               </div>
               {(statistics?.unknown_count || 0) > 0 && (
                 <div className="flex items-center gap-2">
@@ -343,6 +429,93 @@ export function TopUps() {
               )}
             </CardContent>
           </Card>
+
+          {/* 单用户：实付 vs 兑换码统计（输入用户 ID 后显示） */}
+          {exactUserId != null && (
+            <Card className="border-primary/20 bg-primary/5">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-base font-medium flex items-center justify-between gap-2 flex-wrap">
+                  <span>
+                    用户额度入账统计
+                    {userIncome?.username ? (
+                      <span className="text-muted-foreground font-normal ml-2">
+                        {userIncome.username} (ID: {exactUserId})
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground font-normal ml-2">ID: {exactUserId}</span>
+                    )}
+                  </span>
+                  <Button
+                    variant="default"
+                    size="sm"
+                    onClick={handleExport}
+                    disabled={exporting}
+                    className="h-8"
+                  >
+                    {exporting ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Download className="h-3.5 w-3.5 mr-1.5" />}
+                    导出用户明细
+                  </Button>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="pt-0">
+                {userIncomeLoading ? (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    加载用户入账统计...
+                  </div>
+                ) : userIncome ? (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 text-sm">
+                    <div className="rounded-lg border bg-background/80 p-3 space-y-1">
+                      <div className="text-xs text-muted-foreground">成功充值</div>
+                      <div className="font-semibold text-lg">{userIncome.paid_count} 笔</div>
+                      <div className="text-xs text-muted-foreground">在线充值成功单</div>
+                    </div>
+                    <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 space-y-1">
+                      <div className="text-xs text-muted-foreground">实付金额</div>
+                      <div className="font-semibold text-lg text-primary">
+                        {formatMoney(userIncome.paid_money)}
+                      </div>
+                      <div className="text-xs text-muted-foreground">用户实际支付合计</div>
+                    </div>
+                    <div className="rounded-lg border border-amber-200 bg-amber-50/80 dark:bg-amber-950/20 dark:border-amber-900 p-3 space-y-1">
+                      <div className="text-xs text-muted-foreground">未成功充值</div>
+                      <div className="font-semibold text-lg text-amber-700 dark:text-amber-400">
+                        {userIncome.unsuccess_count ?? 0} 笔
+                      </div>
+                      <div className="text-muted-foreground">
+                        金额 {formatMoney(userIncome.unsuccess_money ?? 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground">待处理 + 已过期</div>
+                    </div>
+                    <div className="rounded-lg border bg-background/80 p-3 space-y-1">
+                      <div className="text-xs text-muted-foreground">兑换码使用</div>
+                      <div className="font-semibold text-lg text-amber-600">{userIncome.redemption_count} 次</div>
+                      <div className="text-muted-foreground">
+                        获得额度 {formatAmount(userIncome.redemption_quota_usd)} USD
+                        <span className="text-xs ml-1">（不计入实付）</span>
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-green-200 bg-green-50/80 dark:bg-green-950/20 dark:border-green-900 p-3 space-y-1">
+                      <div className="text-xs text-muted-foreground">在线充值获得额度</div>
+                      <div className="font-semibold text-lg text-green-700 dark:text-green-400">
+                        {formatAmount(userIncome.net_paid_amount_usd)} USD
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        仅在线充值成功单 · 不含兑换码
+                      </div>
+                    </div>
+                    <div className="rounded-lg border bg-background/80 p-3 space-y-1">
+                      <div className="text-xs text-muted-foreground">总入账额度（含兑换）</div>
+                      <div className="font-semibold text-lg">{formatAmount(userIncome.total_income_usd)} USD</div>
+                      <div className="text-xs text-muted-foreground">在线充值额度 + 兑换码额度</div>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground py-2">暂无该用户的入账数据</p>
+                )}
+              </CardContent>
+            </Card>
+          )}
 
           {/* Filters */}
           <Card>
@@ -399,14 +572,14 @@ export function TopUps() {
                   </div>
                 </div>
                 <div className="space-y-1 lg:col-span-2">
-                  <label className="text-xs font-medium text-muted-foreground">用户名搜索</label>
+                  <label className="text-xs font-medium text-muted-foreground">用户搜索</label>
                   <div className="relative">
                     <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                     <Input
                       type="text"
                       value={usernameSearch}
                       onChange={(e) => setUsernameSearch(e.target.value)}
-                      placeholder="按用户名查充值/账单号..."
+                      placeholder="用户名模糊查 / 用户ID精确查"
                       className="pl-9"
                       spellCheck={false}
                       autoComplete="off"
@@ -460,8 +633,8 @@ export function TopUps() {
                       <TableRow>
                         <TableHead className="w-[80px]">ID</TableHead>
                         <TableHead>用户</TableHead>
-                        <TableHead>额度 (USD)</TableHead>
-                        <TableHead>金额 (CNY)</TableHead>
+                        <TableHead title="用户实际支付的金额（top_ups.money）">实付金额 (CNY)</TableHead>
+                        <TableHead title="用户充值后获得的额度（top_ups.amount，USD）">获得额度 (USD)</TableHead>
                         <TableHead>交易号</TableHead>
                         <TableHead>支付渠道</TableHead>
                         <TableHead>状态</TableHead>
@@ -476,11 +649,22 @@ export function TopUps() {
                           <TableCell>
                             <div className="flex flex-col">
                               <span className="font-medium">{record.username || '未知用户'}</span>
-                              <span className="text-xs text-muted-foreground">ID: {record.user_id}</span>
+                              <button
+                                type="button"
+                                className="text-xs text-muted-foreground hover:text-primary text-left w-fit"
+                                title="按此用户 ID 筛选"
+                                onClick={() => setUsernameSearch(String(record.user_id))}
+                              >
+                                ID: {record.user_id}
+                              </button>
                             </div>
                           </TableCell>
-                          <TableCell className="font-medium text-green-600">{formatAmount(record.amount)}</TableCell>
-                          <TableCell className="font-medium">{formatMoney(record.money)}</TableCell>
+                          <TableCell className="font-medium text-primary" title="用户实际支付金额">
+                            {formatMoney(record.money)}
+                          </TableCell>
+                          <TableCell className="font-medium text-green-600" title="用户获得额度">
+                            {formatAmount(record.amount)}
+                          </TableCell>
                           <TableCell>
                             <div className="flex items-center gap-1 max-w-[200px]">
                               <span className="font-mono text-xs text-muted-foreground truncate" title={record.trade_no}>

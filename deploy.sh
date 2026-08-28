@@ -20,6 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 COMPOSE_HOST_FILE="${SCRIPT_DIR}/docker-compose.host.yml"
+COMPOSE_HOST_LOOPBACK_FILE="${SCRIPT_DIR}/docker-compose.host-loopback.yml"
 COMPOSE_LOGDB_FILE="${SCRIPT_DIR}/docker-compose.logdb.yml"
 
 # 由 detect_environment() 设置：host 模式下需要追加 overlay compose 文件
@@ -83,13 +84,20 @@ first_csv() {
 # Docker 环境检测函数 (来自 newapi_detect.sh)
 #######################################
 
+# 识别 DSN 引擎。除 URL 格式外，还要认 NewAPI 常用的两种非 URL 格式：
+#   MySQL Go 原生: user:pass@tcp(host:port)/dbname?charset=...
+#   PG keyword:    host=... user=... password=... dbname=... port=...
 extract_dsn_engine() {
   local dsn="${1:-}"
   if [[ -z "$dsn" ]]; then return 0; fi
-  if [[ "$dsn" =~ ^postgres(ql)?:// ]]; then
+  local lower
+  lower="$(printf '%s' "$dsn" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$lower" =~ ^postgres(ql)?:// || "$lower" =~ (^|[[:space:]])host= ]]; then
     echo "postgres"
-  elif [[ "$dsn" =~ ^mysql:// ]]; then
+  elif [[ "$lower" =~ ^mysql:// || "$lower" =~ @tcp\( ]]; then
     echo "mysql"
+  elif [[ "$lower" =~ ^clickhouse:// ]]; then
+    echo "clickhouse"
   fi
 }
 
@@ -100,35 +108,79 @@ extract_dsn_host() {
   host="$(echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@/]*@([^:/]+).*#\1#p')"
   if [[ -n "$host" ]]; then echo "$host"; return 0; fi
   host="$(echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^:/]+).*#\1#p')"
+  if [[ -n "$host" ]]; then echo "$host"; return 0; fi
+  host="$(echo "$dsn" | sed -nE 's#^.*@tcp\(([^:)]+)(:[0-9]+)?\)/.*#\1#p')"
+  if [[ -n "$host" ]]; then echo "$host"; return 0; fi
+  host="$(echo "$dsn" | sed -nE 's#(^|.*[[:space:]])host=([^[:space:]]+).*#\2#p')"
   echo "$host"
 }
 
-# 从 DSN URL 解析用户名 (postgresql://user:pass@host:port/db)
+# 从 DSN 解析用户名 (postgresql://user:pass@host:port/db | user:pass@tcp(...)/db | user=...)
 extract_dsn_user() {
   local dsn="${1:-}"
   [[ -z "$dsn" ]] && return 0
-  echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^:@/]+)(:[^@/]*)?@.*#\1#p'
+  local user
+  user="$(echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^:@/]+)(:[^@/]*)?@.*#\1#p')"
+  if [[ -n "$user" ]]; then echo "$user"; return 0; fi
+  user="$(echo "$dsn" | sed -nE 's#^([^:@/]+)(:[^@/]*)?@tcp\(.*#\1#p')"
+  if [[ -n "$user" ]]; then echo "$user"; return 0; fi
+  user="$(echo "$dsn" | sed -nE 's#(^|.*[[:space:]])user=([^[:space:]]+).*#\2#p')"
+  echo "$user"
 }
 
-# 从 DSN URL 解析密码
+# 从 DSN 解析密码
 extract_dsn_password() {
   local dsn="${1:-}"
   [[ -z "$dsn" ]] && return 0
-  echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^:@/]+:([^@]*)@.*#\1#p'
+  local password
+  password="$(echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^:@/]+:([^@]*)@.*#\1#p')"
+  if [[ -n "$password" ]]; then echo "$password"; return 0; fi
+  password="$(echo "$dsn" | sed -nE 's#^[^:@/]+:([^@]*)@tcp\(.*#\1#p')"
+  if [[ -n "$password" ]]; then echo "$password"; return 0; fi
+  password="$(echo "$dsn" | sed -nE 's#(^|.*[[:space:]])password=([^[:space:]]+).*#\2#p')"
+  echo "$password"
 }
 
-# 从 DSN URL 解析端口
+# 从 DSN 解析端口
 extract_dsn_port() {
   local dsn="${1:-}"
   [[ -z "$dsn" ]] && return 0
-  echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@[^:/]+:([0-9]+).*#\1#p'
+  local port
+  port="$(echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@[^:/]+:([0-9]+).*#\1#p')"
+  if [[ -n "$port" ]]; then echo "$port"; return 0; fi
+  port="$(echo "$dsn" | sed -nE 's#^.*@tcp\([^:)]*:([0-9]+)\)/.*#\1#p')"
+  if [[ -n "$port" ]]; then echo "$port"; return 0; fi
+  port="$(echo "$dsn" | sed -nE 's#(^|.*[[:space:]])port=([0-9]+).*#\2#p')"
+  echo "$port"
 }
 
-# 从 DSN URL 解析数据库名
+# 从 DSN 解析数据库名
 extract_dsn_dbname() {
   local dsn="${1:-}"
   [[ -z "$dsn" ]] && return 0
-  echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@[^/]+/([^?]+).*#\1#p'
+  local dbname
+  dbname="$(echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@[^/]+/([^?]+).*#\1#p')"
+  if [[ -n "$dbname" ]]; then echo "$dbname"; return 0; fi
+  dbname="$(echo "$dsn" | sed -nE 's#^.*@tcp\([^)]*\)/([^?]+).*#\1#p')"
+  if [[ -n "$dbname" ]]; then echo "$dbname"; return 0; fi
+  dbname="$(echo "$dsn" | sed -nE 's#(^|.*[[:space:]])dbname=([^[:space:]]+).*#\2#p')"
+  echo "$dbname"
+}
+
+# 情形 (a2)：数据库是宿主机裸装进程、只在 127.0.0.1 上监听。
+# 用 host 网络的 socat（docker-compose.host-loopback.yml）把
+# host.docker.internal:HOST_DB_PROXY_PORT 转发到宿主机 127.0.0.1:HOST_DB_PORT。
+configure_host_loopback_proxy() {
+  HOST_DB_PORT="${HOST_DB_PORT:-$DB_PORT}"
+  if [[ -z "${HOST_DB_PROXY_PORT:-}" ]]; then
+    if [[ "$DB_ENGINE" == "postgres" ]]; then
+      HOST_DB_PROXY_PORT="15432"
+    else
+      HOST_DB_PROXY_PORT="13306"
+    fi
+  fi
+  DB_DNS="host.docker.internal"
+  DB_PORT="$HOST_DB_PROXY_PORT"
 }
 
 detect_newapi_container() {
@@ -333,6 +385,9 @@ detect_environment() {
 
   DB_ENGINE="$(extract_dsn_engine "$detected_dsn" || true)"
   DB_DNS="$(extract_dsn_host "$detected_dsn" || true)"
+  USE_HOST_LOOPBACK_PROXY=false
+  HOST_DB_PORT="${HOST_DB_PORT:-}"
+  HOST_DB_PROXY_PORT="${HOST_DB_PROXY_PORT:-}"
 
   # ===== Host 模式：完全从 DSN 解析凭证，跳过数据库容器探测 =====
   if [[ "$USE_HOST_MODE" == "true" ]]; then
@@ -380,9 +435,11 @@ detect_environment() {
         USE_HOST_MODE=false   # 不再脱离 external 网络：我们要挂进它，而非走 host overlay
         ORIGINAL_NETWORK="$_hit_net"
       else
-        # 情形 (a2)：DB 在宿主机回环但非容器（或发布到 0.0.0.0）→ 走宿主机网关
-        DB_DNS="host.docker.internal"
-        log_info "数据库地址改写: 127.0.0.1 → host.docker.internal（数据库在宿主机回环上）"
+        # 情形 (a2)：DB 在宿主机回环但非容器（宿主机裸装进程）。
+        # 不能只改写成 host.docker.internal：若数据库只 bind 127.0.0.1（MySQL/PG 默认常见），
+        # 从网关 IP 进来的连接会被拒。改用 host 网络的 socat 代理转发到宿主机回环。
+        USE_HOST_LOOPBACK_PROXY=true
+        log_info "数据库地址为宿主机回环地址，将通过本机 TCP 代理访问"
       fi
     elif is_ipv4_literal "$DB_DNS"; then
       local _hit _hit_net _hit_name
@@ -404,10 +461,23 @@ detect_environment() {
     fi
 
     if [[ "$USE_HOST_MODE" == "true" ]]; then
+      # 情形 (a2)：宿主机回环数据库 → 配置 socat 代理地址并追加 loopback overlay
+      if [[ "$USE_HOST_LOOPBACK_PROXY" == "true" ]]; then
+        configure_host_loopback_proxy
+        log_info "数据库地址改写: 127.0.0.1:${HOST_DB_PORT} → ${DB_DNS}:${DB_PORT}（本机 TCP 代理）"
+      fi
+
       # 情形 (a)/(c)：数据库走宿主机（host.docker.internal）或外部地址，
       # newapi-tools 无需任何 external 网络 → 加载 host overlay 去掉 newapi-network 依赖。
       if [[ -f "$COMPOSE_HOST_FILE" ]]; then
         COMPOSE_FILES=("-f" "$COMPOSE_FILE" "-f" "$COMPOSE_HOST_FILE")
+        if [[ "$USE_HOST_LOOPBACK_PROXY" == "true" ]]; then
+          if [[ -f "$COMPOSE_HOST_LOOPBACK_FILE" ]]; then
+            COMPOSE_FILES+=("-f" "$COMPOSE_HOST_LOOPBACK_FILE")
+          else
+            log_warn "未找到 $COMPOSE_HOST_LOOPBACK_FILE，宿主机回环数据库可能无法连接"
+          fi
+        fi
       else
         log_warn "未找到 $COMPOSE_HOST_FILE，host 模式可能启动失败"
       fi
@@ -561,7 +631,18 @@ detect_log_database() {
   pass="$(extract_dsn_password "$raw" || true)"
   db="$(extract_dsn_dbname "$raw" || true)"
   [[ -n "$host" && -n "$db" ]] || { log_warn "无法解析 LOG_SQL_DSN（host/dbname 缺失），跳过日志库配置"; return 0; }
-  if [[ "$engine" == "mysql" ]]; then port="${port:-3306}"; else engine="postgres"; port="${port:-5432}"; fi
+  case "$engine" in
+    mysql)
+      port="${port:-3306}"
+      ;;
+    clickhouse)
+      port="${port:-9000}"
+      ;;
+    *)
+      engine="postgres"
+      port="${port:-5432}"
+      ;;
+  esac
 
   # 与主库同款的连接方式改写
   if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "::1" ]]; then
@@ -591,11 +672,17 @@ detect_log_database() {
     log_info "日志库地址为主机名/外部地址，原样使用: ${host}"
   fi
 
-  if [[ "$engine" == "mysql" ]]; then
-    LOG_SQL_DSN_FINAL="${user}:${pass}@tcp(${host}:${port})/${db}?charset=utf8mb4&parseTime=True"
-  else
-    LOG_SQL_DSN_FINAL="host=${host} port=${port} user=${user} password=${pass} dbname=${db} sslmode=disable"
-  fi
+  case "$engine" in
+    mysql)
+      LOG_SQL_DSN_FINAL="${user}:${pass}@tcp(${host}:${port})/${db}?charset=utf8mb4&parseTime=True"
+      ;;
+    clickhouse)
+      LOG_SQL_DSN_FINAL="clickhouse://${user}:${pass}@${host}:${port}/${db}"
+      ;;
+    *)
+      LOG_SQL_DSN_FINAL="host=${host} port=${port} user=${user} password=${pass} dbname=${db} sslmode=disable"
+      ;;
+  esac
 
   # 日志库网络与主库不同时，追加日志叠加层并接入网络（相同则工具已在该网络上）
   if [[ -n "$LOG_NETWORK" && "$LOG_NETWORK" != "${NEWAPI_NETWORK:-}" ]]; then
@@ -718,6 +805,9 @@ DB_PORT=${DB_PORT}
 DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
 DB_PASSWORD=${DB_PASSWORD}
+# 宿主机回环数据库代理 (情形 a2；为空表示未启用)
+HOST_DB_PORT=${HOST_DB_PORT:-}
+HOST_DB_PROXY_PORT=${HOST_DB_PROXY_PORT:-}
 
 # 日志分库 (NewAPI 启用 LOG_SQL_DSN 时自动检测；为空则日志查询回落主库)
 LOG_SQL_DSN=${LOG_SQL_DSN_FINAL:-}
@@ -757,56 +847,171 @@ check_compose_file() {
 }
 
 #######################################
-# 下载 GeoIP 数据库
+# 安全下载单个 GeoIP 文件（带总超时 / 体积上限 / 校验）
+# 解决：镜像挂起或返回异常流时 curl 无限写入占满磁盘（#26）
+# 参数: $1=目标路径  $2=最小字节  $3=最大字节  $4...=URL 列表
+#######################################
+download_geoip_file() {
+  local dest="$1"
+  local min_bytes="$2"
+  local max_bytes="$3"
+  shift 3
+  local urls=("$@")
+  local tmp="${dest}.tmp.$$"
+  local url size head
+
+  for url in "${urls[@]}"; do
+    rm -f "$tmp"
+    # --fail: HTTP 非 2xx 失败；--max-time: 整次传输超时；--max-filesize: 硬体积上限
+    # 可选步骤：短超时，避免国内机器连不上 GitHub 时拖垮部署（#25）
+    if ! curl -fsSL \
+        --connect-timeout 8 \
+        --max-time 60 \
+        --max-filesize "$max_bytes" \
+        --retry 1 \
+        --retry-delay 1 \
+        -o "$tmp" \
+        "$url" 2>/dev/null; then
+      rm -f "$tmp"
+      continue
+    fi
+
+    size=$(stat -c%s "$tmp" 2>/dev/null || stat -f%z "$tmp" 2>/dev/null || echo 0)
+    if [[ -z "$size" || "$size" -lt "$min_bytes" || "$size" -gt "$max_bytes" ]]; then
+      rm -f "$tmp"
+      continue
+    fi
+
+    # 拒绝 HTML/文本错误页（正常 mmdb 为二进制）
+    head=$(head -c 16 "$tmp" 2>/dev/null || true)
+    if [[ "$head" == \<* || "$head" == version\ https://git-lfs* ]]; then
+      rm -f "$tmp"
+      continue
+    fi
+
+    mv -f "$tmp" "$dest"
+    return 0
+  done
+
+  rm -f "$tmp"
+  return 1
+}
+
+#######################################
+# GeoIP 文件是否已就绪
+#######################################
+geoip_files_ready() {
+  local geoip_dir="${1:-${SCRIPT_DIR}/data/geoip}"
+  local city_db="${geoip_dir}/GeoLite2-City.mmdb"
+  local asn_db="${geoip_dir}/GeoLite2-ASN.mmdb"
+  [[ -f "$city_db" && -f "$asn_db" ]] || return 1
+  local cs as
+  cs=$(stat -c%s "$city_db" 2>/dev/null || stat -f%z "$city_db" 2>/dev/null || echo 0)
+  as=$(stat -c%s "$asn_db" 2>/dev/null || stat -f%z "$asn_db" 2>/dev/null || echo 0)
+  [[ "$cs" -ge 1048576 && "$cs" -le 120000000 && "$as" -ge 1048576 && "$as" -le 50000000 ]]
+}
+
+#######################################
+# 下载 GeoIP 数据库（实际下载；失败不退出）
 #######################################
 download_geoip_database() {
   local geoip_dir="${SCRIPT_DIR}/data/geoip"
   local city_db="${geoip_dir}/GeoLite2-City.mmdb"
   local asn_db="${geoip_dir}/GeoLite2-ASN.mmdb"
 
-  # 如果数据库已存在，跳过下载
+  if geoip_files_ready "$geoip_dir"; then
+    log_success "GeoIP 数据库已存在，跳过下载"
+    return 0
+  fi
+  if [[ -f "$city_db" || -f "$asn_db" ]]; then
+    log_warn "已有 GeoIP 文件体积异常，重新下载"
+    rm -f "$city_db" "$asn_db"
+  fi
+
+  log_info "正在下载 GeoIP 数据库（约 70MB，需可访问 GitHub/镜像）..."
+  mkdir -p "$geoip_dir"
+
+  local city_urls=(
+    "https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb"
+    "https://cdn.jsdelivr.net/gh/adysec/IP_database@main/geolite/GeoLite2-City.mmdb"
+    "https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb"
+  )
+  local asn_urls=(
+    "https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-ASN.mmdb"
+    "https://cdn.jsdelivr.net/gh/adysec/IP_database@main/geolite/GeoLite2-ASN.mmdb"
+    "https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-ASN.mmdb"
+  )
+
+  if [[ ! -f "$city_db" ]]; then
+    log_info "下载 GeoLite2-City.mmdb..."
+    if download_geoip_file "$city_db" 1048576 100000000 "${city_urls[@]}"; then
+      log_success "GeoLite2-City.mmdb 下载完成"
+    else
+      log_warn "GeoLite2-City.mmdb 下载失败（短超时，不阻塞部署）"
+      rm -f "$city_db" "${city_db}.tmp"*
+    fi
+  fi
+
+  if [[ ! -f "$asn_db" ]]; then
+    log_info "下载 GeoLite2-ASN.mmdb..."
+    if download_geoip_file "$asn_db" 1048576 40000000 "${asn_urls[@]}"; then
+      log_success "GeoLite2-ASN.mmdb 下载完成"
+    else
+      log_warn "GeoLite2-ASN.mmdb 下载失败（短超时，不阻塞部署）"
+      rm -f "$asn_db" "${asn_db}.tmp"*
+    fi
+  fi
+
   if [[ -f "$city_db" && -f "$asn_db" ]]; then
+    log_success "GeoIP 数据库下载完成"
+  else
+    log_warn "GeoIP 未就绪：IP 地理定位不可用，其它功能不受影响。可稍后 DOWNLOAD_GEOIP=1 ./deploy.sh 或手动放入 data/geoip/"
+  fi
+  return 0
+}
+
+#######################################
+# 可选下载 GeoIP（#25）
+# DOWNLOAD_GEOIP=1 强制下载；=0 / SKIP_GEOIP_DOWNLOAD=1 跳过
+# 交互默认 [y/N] 跳过；非交互默认跳过
+#######################################
+maybe_download_geoip_database() {
+  local force="${1:-}"
+  local geoip_dir="${SCRIPT_DIR}/data/geoip"
+
+  if [[ "$force" != "force" ]] && geoip_files_ready "$geoip_dir"; then
     log_success "GeoIP 数据库已存在，跳过下载"
     return 0
   fi
 
-  log_info "正在下载 GeoIP 数据库..."
-  mkdir -p "$geoip_dir"
-
-  # 下载源（优先 GitHub 直链，备用国内镜像）
-  local base_url="https://raw.githubusercontent.com/adysec/IP_database/main/geolite"
-  local fallback_url="https://raw.gitmirror.com/adysec/IP_database/main/geolite"
-
-  # 下载 City 数据库
-  if [[ ! -f "$city_db" ]]; then
-    log_info "下载 GeoLite2-City.mmdb..."
-    if ! curl -sL --connect-timeout 15 -o "$city_db" "${base_url}/GeoLite2-City.mmdb" 2>/dev/null; then
-      log_warn "GitHub 下载失败，尝试国内镜像..."
-      curl -sL --connect-timeout 30 -o "$city_db" "${fallback_url}/GeoLite2-City.mmdb" 2>/dev/null || {
-        log_warn "GeoLite2-City.mmdb 下载失败，IP 地理位置功能可能不可用"
-        rm -f "$city_db"
-      }
+  local want=""
+  if [[ "$force" == "force" ]]; then
+    want="yes"
+  elif [[ "${DOWNLOAD_GEOIP:-}" =~ ^(1|true|yes|YES|True)$ ]]; then
+    want="yes"
+  elif [[ "${SKIP_GEOIP_DOWNLOAD:-}" =~ ^(1|true|yes|YES|True)$ || "${DOWNLOAD_GEOIP:-}" =~ ^(0|false|no|NO|False)$ ]]; then
+    want="no"
+  elif [[ -t 0 ]]; then
+    echo ""
+    log_info "GeoIP 数据库用于 IP 地理定位 / 跨城风控（约 70MB）"
+    log_info "国内云主机若无法访问 GitHub，下载会失败；跳过不影响核心功能"
+    read -r -p "是否现在下载 GeoIP 数据库? [y/N]: " confirm
+    if [[ "$confirm" =~ ^[yY]$ ]]; then
+      want="yes"
+    else
+      want="no"
     fi
-  fi
-
-  # 下载 ASN 数据库
-  if [[ ! -f "$asn_db" ]]; then
-    log_info "下载 GeoLite2-ASN.mmdb..."
-    if ! curl -sL --connect-timeout 15 -o "$asn_db" "${base_url}/GeoLite2-ASN.mmdb" 2>/dev/null; then
-      log_warn "GitHub 下载失败，尝试国内镜像..."
-      curl -sL --connect-timeout 30 -o "$asn_db" "${fallback_url}/GeoLite2-ASN.mmdb" 2>/dev/null || {
-        log_warn "GeoLite2-ASN.mmdb 下载失败，ASN 查询功能可能不可用"
-        rm -f "$asn_db"
-      }
-    fi
-  fi
-
-  # 检查下载结果
-  if [[ -f "$city_db" && -f "$asn_db" ]]; then
-    log_success "GeoIP 数据库下载完成"
   else
-    log_warn "部分 GeoIP 数据库下载失败，可稍后手动下载"
+    want="no"
   fi
+
+  if [[ "$want" != "yes" ]]; then
+    log_info "已跳过 GeoIP 下载（可选）。需要时: DOWNLOAD_GEOIP=1 ./deploy.sh"
+    mkdir -p "$geoip_dir" 2>/dev/null || true
+    return 0
+  fi
+
+  download_geoip_database
 }
 
 #######################################
@@ -815,14 +1020,16 @@ download_geoip_database() {
 start_services() {
   log_info "启动服务..."
 
-  # 下载 GeoIP 数据库
-  download_geoip_database
+  # GeoIP 可选（#25）
+  maybe_download_geoip_database
 
   # 检查是否有旧容器
   if docker ps -a --format '{{.Names}}' | grep -qE '^newapi-tools$'; then
     log_warn "发现已存在的服务容器，正在停止..."
     $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" down 2>/dev/null || true
   fi
+  # 回环代理容器可能属于上一次不同的 compose 组合，单独清理
+  docker rm -f newapi-tools-db-proxy 2>/dev/null || true
 
   # 拉取最新镜像
   log_info "拉取最新镜像..."
@@ -914,6 +1121,7 @@ uninstall() {
 
   if [[ -f "$COMPOSE_FILE" && -f "$ENV_FILE" ]]; then
     $DOCKER_COMPOSE -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v 2>/dev/null || true
+    docker rm -f newapi-tools-db-proxy 2>/dev/null || true
     log_success "容器已停止并移除"
   fi
 
@@ -959,6 +1167,8 @@ NewAPI Middleware Tool - 一键部署脚本
   API_KEY            后端 API Key (默认: 交互式输入或自动生成)
   FRONTEND_PORT      前端端口 (默认: 1145)
   FRONTEND_BIND      前端端口绑定网卡 0.0.0.0/127.0.0.1 (默认: 交互式选择)
+  DOWNLOAD_GEOIP     是否下载 GeoIP（1=下载, 0=跳过；默认交互询问且默认跳过）
+  SKIP_GEOIP_DOWNLOAD  设为 1 时强制跳过 GeoIP 下载
 
 示例:
   # 基本部署
@@ -969,6 +1179,12 @@ NewAPI Middleware Tool - 一键部署脚本
 
   # 非交互式部署，用 nginx 反代模式
   ADMIN_PASSWORD=mypass API_KEY=mykey FRONTEND_BIND=127.0.0.1 ./deploy.sh
+
+  # 跳过 GeoIP（国内云主机推荐，部署不因外网失败而卡住）
+  DOWNLOAD_GEOIP=0 ./deploy.sh
+
+  # 明确下载 GeoIP
+  DOWNLOAD_GEOIP=1 ./deploy.sh
 EOF
 }
 

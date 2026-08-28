@@ -16,10 +16,12 @@ import (
 
 // TopUpRecord represents a top-up record
 type TopUpRecord struct {
-	ID                int64    `json:"id" db:"id"`
-	UserID            int64    `json:"user_id" db:"user_id"`
-	Username          *string  `json:"username" db:"username"`
-	Amount            int64    `json:"amount" db:"amount"`
+	ID       int64   `json:"id" db:"id"`
+	UserID   int64   `json:"user_id" db:"user_id"`
+	Username *string `json:"username" db:"username"`
+	// Amount 用户获得的额度（USD 数量，易支付等渠道；非 raw quota）
+	Amount int64 `json:"amount" db:"amount"`
+	// Money 用户实际支付金额（多为 CNY；Stripe 等渠道语义可能不同）
 	Money             float64  `json:"money" db:"money"`
 	TradeNo           string   `json:"trade_no" db:"trade_no"`
 	PaymentMethod     string   `json:"payment_method" db:"payment_method"`
@@ -211,6 +213,14 @@ func buildTopUpWhere(params ListTopUpParams) (string, []interface{}, int) {
 		where = append(where, fmt.Sprintf("t.user_id = %s", db.Placeholder(argIdx)))
 		args = append(args, *params.UserID)
 		argIdx++
+	} else {
+		// 全局面板白名单：列表默认排除；显式按 user_id 查询时仍可审计该用户
+		if cond, wlArgs, next := PanelWhitelistNotInSQL("t.user_id", argIdx); cond != "" {
+			// cond 自带 AND 前缀，改成 where 片段
+			where = append(where, strings.TrimPrefix(strings.TrimSpace(cond), "AND "))
+			args = append(args, wlArgs...)
+			argIdx = next
+		}
 	}
 
 	if params.InviterID != nil {
@@ -376,7 +386,14 @@ var TopUpExportLimit int64 = 100000
 // responsible for setting response headers and (recommended) running CountTopUps
 // first to short-circuit oversized exports — this function only flips on the
 // limit if the count exceeds it mid-stream.
+//
+// 当 params.UserID 已指定时，走「单用户额度入账」导出：在线充值 + 兑换码明细，
+// CSV 标注类型/是否计入实付，并在末尾附剔除兑换码后的统计摘要。
 func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams) error {
+	if params.UserID != nil && *params.UserID > 0 {
+		return exportUserIncomeCSV(ctx, w, params)
+	}
+
 	db := database.Get()
 	whereSQL, args, _ := buildTopUpWhere(params)
 
@@ -389,7 +406,7 @@ func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams)
 	defer csvW.Flush()
 
 	header := []string{
-		"ID", "用户ID", "用户名", "额度(USD)", "金额(CNY)",
+		"ID", "用户ID", "用户名", "获得额度(USD)", "实付金额(CNY)",
 		"交易号", "支付方式", "支付渠道", "状态", "归一状态", "完成耗时(秒)", "异常标记", "创建时间", "完成时间",
 	}
 	if err := csvW.Write(header); err != nil {
@@ -491,6 +508,11 @@ func GetTopUpStatistics(startDate, endDate string) (*TopUpStatistics, error) {
 			args = append(args, ts)
 			argIdx++
 		}
+	}
+	if cond, wlArgs, next := PanelWhitelistNotInSQL("user_id", argIdx); cond != "" {
+		where = append(where, strings.TrimPrefix(strings.TrimSpace(cond), "AND "))
+		args = append(args, wlArgs...)
+		argIdx = next
 	}
 
 	whereSQL := "1=1"

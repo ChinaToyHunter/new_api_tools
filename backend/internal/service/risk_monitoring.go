@@ -80,6 +80,43 @@ func (s *RiskMonitoringService) enrichUserInfo(rows []map[string]interface{}) {
 	}
 }
 
+func (s *RiskMonitoringService) enrichChannelNames(rows []map[string]interface{}) {
+	if len(rows) == 0 {
+		return
+	}
+	ids := make([]interface{}, 0, len(rows))
+	seen := make(map[int64]bool)
+	for _, row := range rows {
+		id := toInt64(row["channel_id"])
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	ph := make([]string, len(ids))
+	for i := range ids {
+		ph[i] = s.db.Placeholder(i + 1)
+	}
+	query := fmt.Sprintf("SELECT id, COALESCE(name, '') as name FROM channels WHERE id IN (%s)", strings.Join(ph, ","))
+	channelRows, err := s.db.Query(query, ids...)
+	if err != nil {
+		return
+	}
+	names := make(map[int64]string, len(channelRows))
+	for _, row := range channelRows {
+		names[toInt64(row["id"])] = toString(row["name"])
+	}
+	for _, row := range rows {
+		if name, ok := names[toInt64(row["channel_id"])]; ok {
+			row["channel_name"] = name
+		}
+	}
+}
+
 // GetLeaderboards returns usage leaderboards across multiple time windows
 func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sortBy string) (map[string]interface{}, error) {
 	cm := cache.Get()
@@ -110,6 +147,12 @@ func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sor
 
 		// Aggregate from logs first (logs may live in a separate DB → no JOIN users).
 		// display_name / status come from the main DB in a second step below.
+		uniqueIPsExpr := s.logDB.CountDistinctNonEmpty("l.ip")
+		wlCond, wlArgs := PanelWhitelistNotInClause("l.user_id")
+		wlSQL := ""
+		if wlCond != "" {
+			wlSQL = " AND " + wlCond
+		}
 		query := s.logDB.RebindQuery(fmt.Sprintf(`
 			SELECT l.user_id as user_id,
 				COALESCE(NULLIF(MAX(l.username), ''), '') as username,
@@ -119,16 +162,19 @@ func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sor
 				COALESCE(SUM(l.quota), 0) as quota_used,
 				COALESCE(SUM(l.prompt_tokens), 0) as prompt_tokens,
 				COALESCE(SUM(l.completion_tokens), 0) as completion_tokens,
-				COALESCE(COUNT(DISTINCT NULLIF(l.ip, '')), 0) as unique_ips
+				COALESCE(%s, 0) as unique_ips
 			FROM logs l
 			WHERE l.created_at >= ? AND l.created_at <= ?
 				AND l.type IN (2, 5)
-				AND l.user_id IS NOT NULL
+				AND l.user_id IS NOT NULL%s
 			GROUP BY l.user_id
 			ORDER BY %s
-			LIMIT ?`, orderBy))
+			LIMIT ?`, uniqueIPsExpr, wlSQL, orderBy))
 
-		rows, err := s.logDB.Query(query, startTime, now, limit)
+		qArgs := []interface{}{startTime, now}
+		qArgs = append(qArgs, wlArgs...)
+		qArgs = append(qArgs, limit)
+		rows, err := s.logDB.Query(query, qArgs...)
 		if err != nil {
 			windowsData[window] = []map[string]interface{}{}
 			continue
@@ -158,10 +204,7 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	startTime := now - windowSeconds
 
 	// User info
-	groupCol := "`group`"
-	if s.db.IsPG {
-		groupCol = `"group"`
-	}
+	groupCol := s.db.QuoteIdentifier("group")
 	userRow, _ := s.db.QueryOne(s.db.RebindQuery(
 		fmt.Sprintf("SELECT id, username, display_name, email, status, %s, remark, linux_do_id, request_count FROM users WHERE id = ? AND deleted_at IS NULL", groupCol)), userID)
 
@@ -188,20 +231,21 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	}
 
 	// Usage stats in window
-	statsQuery := s.logDB.RebindQuery(`
+	uniqueIPsExpr := s.logDB.CountDistinctNonEmpty("l.ip")
+	statsQuery := s.logDB.RebindQuery(fmt.Sprintf(`
 		SELECT COUNT(*) as total_requests,
-			SUM(CASE WHEN type = 2 THEN 1 ELSE 0 END) as success_requests,
-			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure_requests,
-			COALESCE(SUM(quota), 0) as quota_used,
-			COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
-			COALESCE(SUM(completion_tokens), 0) as completion_tokens,
-			COUNT(DISTINCT NULLIF(ip, '')) as unique_ips,
-			COUNT(DISTINCT token_id) as unique_tokens,
-			COUNT(DISTINCT model_name) as unique_models,
-			COUNT(DISTINCT channel_id) as unique_channels,
-			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty_count
-		FROM logs
-		WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND type IN (2, 5)`)
+			SUM(CASE WHEN l.type = 2 THEN 1 ELSE 0 END) as success_requests,
+			SUM(CASE WHEN l.type = 5 THEN 1 ELSE 0 END) as failure_requests,
+			COALESCE(SUM(l.quota), 0) as quota_used,
+			COALESCE(SUM(l.prompt_tokens), 0) as prompt_tokens,
+			COALESCE(SUM(l.completion_tokens), 0) as completion_tokens,
+			%s as unique_ips,
+			COUNT(DISTINCT l.token_id) as unique_tokens,
+			COUNT(DISTINCT l.model_name) as unique_models,
+			COUNT(DISTINCT l.channel_id) as unique_channels,
+			SUM(CASE WHEN l.type = 2 AND l.completion_tokens = 0 THEN 1 ELSE 0 END) as empty_count
+		FROM logs l
+		WHERE l.user_id = ? AND l.created_at >= ? AND l.created_at <= ? AND l.type IN (2, 5)`, uniqueIPsExpr))
 
 	statsRow, _ := s.logDB.QueryOne(statsQuery, userID, startTime, now)
 
@@ -299,28 +343,30 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	}
 	ipSwitchAnalysis := analyzeIPSwitches(ipSequence)
 
-	// Risk flags
+	// Geo 聚合：distinct IP batch lookup，用于「同城抖动 vs 跨城跳跃」分层（#20）
+	distinctIPs := collectDistinctIPs(ipSequence)
+	geoAvailable := IsIPGeoAvailable()
+	var geoMap map[string]IPGeoInfo
+	if geoAvailable && len(distinctIPs) > 0 {
+		geoMap = LookupIPGeoBatch(distinctIPs)
+	} else {
+		geoMap = map[string]IPGeoInfo{}
+	}
+	geoAnalysis := analyzeIPGeoFromSequence(ipSequence, geoMap, geoAvailable)
+	if details, ok := ipSwitchAnalysis["switch_details"].([]map[string]interface{}); ok && len(details) > 0 {
+		enrichSwitchDetailsWithGeo(details, geoMap)
+	}
+
+	// Risk flags（非 IP 类）
 	riskFlags := []string{}
 	if requestsPerMinute > 5.0 {
 		riskFlags = append(riskFlags, "HIGH_RPM")
 	}
-	if uniqueIPs > 10 {
-		riskFlags = append(riskFlags, "MANY_IPS")
-	}
 	if failureRate > 50.0 && totalRequests > 10 {
 		riskFlags = append(riskFlags, "HIGH_FAILURE_RATE")
 	}
-
-	// IP switch risk flags (matching Python logic)
-	avgIPDuration := toFloat64(ipSwitchAnalysis["avg_ip_duration"])
-	rapidSwitchCount := toInt64(ipSwitchAnalysis["rapid_switch_count"])
-	realSwitchCount := toInt64(ipSwitchAnalysis["real_switch_count"])
-	if rapidSwitchCount >= 3 && avgIPDuration < 300 {
-		riskFlags = append(riskFlags, "IP_RAPID_SWITCH")
-	}
-	if avgIPDuration < 30 && realSwitchCount >= 3 {
-		riskFlags = append(riskFlags, "IP_HOPPING")
-	}
+	// IP / 地理相关 flags（同城多 IP 不再直接 MANY_IPS）
+	riskFlags = appendGeoAwareIPRiskFlags(riskFlags, uniqueIPs, ipSwitchAnalysis, geoAnalysis)
 
 	// Checkin anomaly detection
 	checkin := analyzeCheckins(s.db, userID, startTime, now)
@@ -349,6 +395,7 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		"avg_quota_per_request": avgQuotaPerRequest,
 		"risk_flags":            riskFlags,
 		"ip_switch_analysis":    ipSwitchAnalysis,
+		"ip_geo_analysis":       geoAnalysis,
 	}
 	if checkinAnalysisMap != nil {
 		risk["checkin_analysis"] = checkinAnalysisMap
@@ -372,20 +419,27 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		topModels = []map[string]interface{}{}
 	}
 
-	// Top channels
-	channelsQuery := s.logDB.RebindQuery(`
-		SELECT channel_id, COALESCE(MAX(channel_name), '') as channel_name,
+	// ClickHouse logs omit channel_name, so enrich those rows from the main DB.
+	channelNameExpr := "COALESCE(MAX(channel_name), '')"
+	if s.logDB.IsCH {
+		channelNameExpr = "''"
+	}
+	channelsQuery := s.logDB.RebindQuery(fmt.Sprintf(`
+		SELECT channel_id, %s as channel_name,
 			COUNT(*) as requests,
 			COALESCE(SUM(quota), 0) as quota_used
 		FROM logs
 		WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND type IN (2, 5)
 		GROUP BY channel_id
 		ORDER BY requests DESC
-		LIMIT 10`)
+		LIMIT 10`, channelNameExpr))
 
 	topChannels, _ := s.logDB.Query(channelsQuery, userID, startTime, now)
 	if topChannels == nil {
 		topChannels = []map[string]interface{}{}
+	}
+	if s.logDB.IsCH {
+		s.enrichChannelNames(topChannels)
 	}
 
 	// Top IPs
@@ -401,9 +455,43 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	if topIPs == nil {
 		topIPs = []map[string]interface{}{}
 	}
+	// 给 Top IP 补地理标签（复用上面的 geoMap；Top 里可能有序列外 IP，再查一次缺口）
+	if geoAvailable && len(topIPs) > 0 {
+		need := make([]string, 0)
+		for _, row := range topIPs {
+			ip := fmt.Sprintf("%v", row["ip"])
+			if ip == "" {
+				continue
+			}
+			if _, ok := geoMap[ip]; !ok {
+				need = append(need, ip)
+			}
+		}
+		if len(need) > 0 {
+			extra := LookupIPGeoBatch(need)
+			for ip, info := range extra {
+				geoMap[ip] = info
+			}
+		}
+		for _, row := range topIPs {
+			ip := fmt.Sprintf("%v", row["ip"])
+			info := geoMap[ip]
+			row["city"] = info.City
+			row["region"] = info.Region
+			row["country"] = info.Country
+			row["country_code"] = info.CountryCode
+			row["geo_label"] = geoDisplayLabel(info)
+		}
+	}
 
-	// Recent logs (token_name and channel_name are directly in logs table)
-	recentLogsQuery := s.logDB.RebindQuery(`
+	// ClickHouse compatibility ids are commonly zero, so use the real sort key.
+	recentChannelNameExpr := "COALESCE(channel_name, '')"
+	recentOrder := "id DESC"
+	if s.logDB.IsCH {
+		recentChannelNameExpr = "''"
+		recentOrder = "created_at DESC, request_id DESC"
+	}
+	recentLogsQuery := s.logDB.RebindQuery(fmt.Sprintf(`
 		SELECT id, created_at, type, COALESCE(model_name,'') as model_name,
 			COALESCE(quota, 0) as quota,
 			COALESCE(prompt_tokens, 0) as prompt_tokens,
@@ -411,17 +499,20 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 			COALESCE(use_time, 0) as use_time,
 			COALESCE(ip, '') as ip,
 			COALESCE(channel_id, 0) as channel_id,
-			COALESCE(channel_name, '') as channel_name,
+			%s as channel_name,
 			COALESCE(token_id, 0) as token_id,
 			COALESCE(token_name, '') as token_name
 		FROM logs
 		WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND type IN (2, 5)
-		ORDER BY id DESC
-		LIMIT 50`)
+		ORDER BY %s
+		LIMIT 50`, recentChannelNameExpr, recentOrder))
 
 	recentLogs, _ := s.logDB.Query(recentLogsQuery, userID, startTime, now)
 	if recentLogs == nil {
 		recentLogs = []map[string]interface{}{}
+	}
+	if s.logDB.IsCH {
+		s.enrichChannelNames(recentLogs)
 	}
 
 	result := map[string]interface{}{

@@ -164,14 +164,16 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 	slotMap := make(map[int64]*slotInfo, numSlots)
 
 	// Fill in actual data from query results
-	for _, row := range rows {
-		idx := toInt64(row["slot_idx"])
-		if idx >= 0 && idx < int64(numSlots) {
-			slotMap[idx] = &slotInfo{
-				total:   toInt64(row["total"]),
-				success: toInt64(row["success"]),
-				failure: toInt64(row["failure"]),
-				empty:   toInt64(row["empty_count"]),
+	if rows != nil {
+		for _, row := range rows {
+			idx := toInt64(row["slot_idx"])
+			if idx >= 0 && idx < int64(numSlots) {
+				slotMap[idx] = &slotInfo{
+					total:   toInt64(row["total"]),
+					success: toInt64(row["success"]),
+					failure: toInt64(row["failure"]),
+					empty:   toInt64(row["empty_count"]),
+				}
 			}
 		}
 	}
