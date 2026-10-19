@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { cn } from '../lib/utils'
+import { readSelectionConfig, saveModelSelection, sameModels, mergeSelectableModels, selectedModelStatuses, modelMatchesGroup, filterModelGroup, modelGroupCounts, modelStatusCounts, filterModelStatus, sortModelStatuses } from '../lib/model-status'
+import type { ModelStatus, SlotStatus, SortMode, StatusFilter } from '../lib/model-status'
 import { RefreshCw, Loader2, Timer, ChevronDown, Settings2, Check, Clock, Palette, Moon, Sun, Minimize2, Maximize2, Zap, Terminal, Leaf, Droplets, HelpCircle, Copy, X, Command, LayoutGrid, Bot, MessageSquareQuote, Triangle, Sparkles, CreditCard, GitBranch, Gamepad2, Rocket, Brain, ArrowUpDown, GripVertical, Search, Filter, Layers, Plus, Pencil, Trash2, FolderPlus, Tag, KeyRound } from 'lucide-react'
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, sortableKeyboardCoordinates, rectSortingStrategy, useSortable } from '@dnd-kit/sortable'
@@ -16,27 +18,6 @@ import {
   Zhipu, ChatGLM, Cohere, Perplexity, Together, OpenRouter, Fireworks,
   Ai360, Doubao, Wenxin, Meta, Coze, Cerebras, Kimi, NewAPI, ZAI, ModelScope
 } from '@lobehub/icons'
-
-interface SlotStatus {
-  slot: number
-  start_time: number
-  end_time: number
-  total_requests: number
-  success_count: number
-  success_rate: number
-  status: 'green' | 'yellow' | 'red'
-}
-
-interface ModelStatus {
-  model_name: string
-  display_name: string
-  time_window: string
-  total_requests: number
-  success_count: number
-  success_rate: number
-  current_status: 'green' | 'yellow' | 'red'
-  slot_data: SlotStatus[]
-}
 
 interface ModelStatusMonitorProps {
   isEmbed?: boolean
@@ -147,49 +128,6 @@ interface CustomModelGroup {
   name: string
   icon?: string // key from GROUP_ICON_OPTIONS
   models: string[] // exact model names in this group
-}
-
-// 厂商关键字映射：当某个 vendor 分组配置了对应的 icon 时，
-// 模型名包含这些关键字（不区分大小写）也会被自动算入该分组。
-// 这样新增的模型（如 claude-opus-4-7）无需手动勾选就能出现在 Claude 分组下。
-const VENDOR_KEYWORDS: Record<string, string[]> = {
-  openai: ['gpt', 'openai', 'o1', 'o3', 'chatgpt', 'dall-e', 'whisper', 'tts'],
-  claude: ['claude', 'anthropic'],
-  gemini: ['gemini', 'gemma', 'bard'],
-  deepseek: ['deepseek'],
-  meta: ['llama', 'meta'],
-  mistral: ['mistral', 'mixtral', 'codestral', 'pixtral'],
-  qwen: ['qwen', 'tongyi'],
-  zhipu: ['glm', 'chatglm', 'zhipu'],
-  moonshot: ['moonshot', 'kimi'],
-  kimi: ['kimi', 'moonshot'],
-  doubao: ['doubao', 'bytedance'],
-  minimax: ['minimax', 'abab'],
-  baichuan: ['baichuan'],
-  yi: ['yi-', '01-ai', 'zero-one'],
-  spark: ['spark', 'xunfei'],
-  hunyuan: ['hunyuan', 'tencent'],
-  stepfun: ['stepfun', 'step-'],
-  wenxin: ['wenxin', 'ernie', 'baidu'],
-  cohere: ['cohere', 'command'],
-  perplexity: ['perplexity', 'pplx', 'sonar'],
-  groq: ['groq'],
-  ollama: ['ollama'],
-  together: ['together'],
-  openrouter: ['openrouter'],
-  siliconcloud: ['siliconcloud', 'silicon'],
-  coze: ['coze'],
-  cerebras: ['cerebras'],
-}
-
-// 判断某个模型是否属于某个自定义分组（精确名 + 厂商关键字模糊匹配）
-function modelMatchesGroup(modelName: string, group: CustomModelGroup): boolean {
-  if (group.models.includes(modelName)) return true
-  if (!group.icon) return false
-  const keywords = VENDOR_KEYWORDS[group.icon]
-  if (!keywords) return false
-  const lower = modelName.toLowerCase()
-  return keywords.some(k => lower.includes(k))
 }
 
 // Available icons for groups (from @lobehub/icons)
@@ -360,11 +298,6 @@ const SORT_MODE_KEY = 'model_status_sort_mode'
 const CUSTOM_ORDER_KEY = 'model_status_custom_order'
 // Note: MODEL_GROUP_KEY is defined alongside MODEL_GROUPS above
 
-// Sort mode type
-type SortMode = 'default' | 'availability' | 'custom'
-
-// Status filter type
-type StatusFilter = 'all' | 'green' | 'yellow' | 'red'
 
 export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps) {
   const { token } = useAuth()
@@ -373,6 +306,14 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   const [availableModels, setAvailableModels] = useState<ModelWithStats[]>([])
   const [selectedModels, setSelectedModels] = useState<string[]>([])
   const [modelStatuses, setModelStatuses] = useState<ModelStatus[]>([])
+  const [draftModels, setDraftModels] = useState<string[]>([])
+  const [savingSelection, setSavingSelection] = useState(false)
+  const [selectionError, setSelectionError] = useState('')
+  const [configError, setConfigError] = useState('')
+  const [configLoaded, setConfigLoaded] = useState(false)
+  const savingSelectionRef = useRef(false)
+  const statusRequestRef = useRef(0)
+  const configRequestRef = useRef(0)
   const [loading, setLoading] = useState(true)
   const [initialLoading, setInitialLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -444,7 +385,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   }, [isEmbed])
 
   // Click outside handlers
-  useClickOutside(modelSelectorRef, () => setShowModelSelector(false), showModelSelector)
+  useClickOutside(modelSelectorRef, () => { if (!savingSelectionRef.current) setShowModelSelector(false) }, showModelSelector)
   useClickOutside(intervalDropdownRef, () => setShowIntervalDropdown(false), showIntervalDropdown)
   useClickOutside(windowDropdownRef, () => setShowWindowDropdown(false), showWindowDropdown)
   useClickOutside(themeDropdownRef, () => setShowThemeDropdown(false), showThemeDropdown)
@@ -510,19 +451,32 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     }
   }, [apiUrl, getAuthHeaders])
 
-  // Save selected models to backend cache
-  const saveSelectedModelsToBackend = useCallback(async (models: string[]) => {
+  // Commit only after the backend confirms and a fresh read returns the same list.
+  const saveSelectedModelsToBackend = useCallback(async () => {
+    if (savingSelectionRef.current) return
+    savingSelectionRef.current = true
+    setSavingSelection(true)
+    setSelectionError('')
     try {
-      await fetch(`${apiUrl}/api/model-status/config/selected`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ models }),
-      })
-      localStorage.setItem(SELECTED_MODELS_KEY, JSON.stringify(models))
+      const models = await saveModelSelection(`${apiUrl}/api/model-status/config/selected`, draftModels, getAuthHeaders())
+      statusRequestRef.current++
+      setSelectedModels(models)
+      setDraftModels(models)
+      setModelStatuses(previous => previous.filter(model => models.includes(model.model_name)))
+      setGroupFilter('all')
+      setStatusFilter('all')
+      try { localStorage.setItem(SELECTED_MODELS_KEY, JSON.stringify(models)) } catch { /* server remains authoritative */ }
+      setShowModelSelector(false)
+      showToast('success', `已保存 ${models.length} 个模型，公开页会自动同步`)
     } catch (error) {
-      console.error('Failed to save selected models:', error)
+      const message = error instanceof Error ? error.message : '保存模型名单失败'
+      setSelectionError(`${message}，公开页同步尚未确认，请重试`)
+      showToast('error', '模型名单保存未确认')
+    } finally {
+      savingSelectionRef.current = false
+      setSavingSelection(false)
     }
-  }, [apiUrl, getAuthHeaders])
+  }, [apiUrl, draftModels, getAuthHeaders, showToast])
 
   // Save sort config to backend cache
   const saveSortConfigToBackend = useCallback(async (mode: SortMode, order?: string[]) => {
@@ -541,63 +495,33 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     }
   }, [apiUrl, getAuthHeaders])
 
-  // Load config from backend on mount
-  const loadConfigFromBackend = useCallback(async () => {
-    try {
-      const response = await fetch(`${apiUrl}/api/model-status/config/selected`, {
-        headers: getAuthHeaders(),
-      })
-      const data = await response.json()
-      if (data.success) {
-        if (Array.isArray(data.data) && data.data.length > 0) {
-          setSelectedModels(data.data)
-          localStorage.setItem(SELECTED_MODELS_KEY, JSON.stringify(data.data))
-        }
-        if (data.time_window) {
-          setTimeWindow(data.time_window)
-          localStorage.setItem(TIME_WINDOW_KEY, data.time_window)
-        }
-        if (data.theme) {
-          // Validate theme exists, fallback to daylight for legacy values (light/dark/system)
-          const validTheme = THEMES.find(t => t.id === data.theme) ? data.theme : 'daylight'
-          setTheme(validTheme)
-          localStorage.setItem(THEME_KEY, validTheme)
-        }
-        if (data.refresh_interval !== undefined && data.refresh_interval !== null) {
-          setRefreshInterval(data.refresh_interval)
-          setCountdown(data.refresh_interval)
-          localStorage.setItem(REFRESH_INTERVAL_KEY, data.refresh_interval.toString())
-        }
-        if (data.sort_mode) {
-          setSortMode(data.sort_mode as SortMode)
-          localStorage.setItem(SORT_MODE_KEY, data.sort_mode)
-        }
-        if (data.custom_order && data.custom_order.length > 0) {
-          setCustomOrder(data.custom_order)
-          localStorage.setItem(CUSTOM_ORDER_KEY, JSON.stringify(data.custom_order))
-        }
-        // Load custom groups from backend
-        if (data.custom_groups && Array.isArray(data.custom_groups)) {
-          setCustomGroups(data.custom_groups as CustomModelGroup[])
-        }
-        // Load site title
-        if (data.site_title !== undefined) {
-          setSiteTitle(data.site_title || '')
-        }
-        return data.data || []
-      }
-    } catch (error) {
-      console.error('Failed to load config from backend:', error)
+  // Load only the server selection; an empty list is an explicit configuration.
+  const loadConfigFromBackend = useCallback(async (requestId: number) => {
+    const data = await readSelectionConfig(`${apiUrl}${getApiPrefix()}/config/selected`, {
+      headers: getAuthHeaders(),
+    })
+    if (requestId !== configRequestRef.current) return false
+    statusRequestRef.current++
+    setSelectedModels(data.data)
+    setDraftModels(data.data)
+    setModelStatuses(previous => previous.filter(model => data.data.includes(model.model_name)))
+    setConfigError('')
+    setConfigLoaded(true)
+    if (data.time_window) setTimeWindow(data.time_window)
+    if (data.theme) {
+      setTheme(THEMES.find(theme => theme.id === data.theme) ? data.theme : 'daylight')
     }
-    // Fallback to localStorage
-    const saved = localStorage.getItem(SELECTED_MODELS_KEY)
-    if (saved) {
-      const models = JSON.parse(saved)
-      setSelectedModels(models)
-      return models
+    if (data.refresh_interval !== undefined) {
+      setRefreshInterval(data.refresh_interval)
+      setCountdown(data.refresh_interval)
     }
-    return []
-  }, [apiUrl, getAuthHeaders])
+    setSortMode(data.sort_mode || 'default')
+    setCustomOrder(data.custom_order || [])
+    setCustomGroups(data.custom_groups || [])
+    setSiteTitle(data.site_title || '')
+    try { localStorage.setItem(SELECTED_MODELS_KEY, JSON.stringify(data.data)) } catch { /* optional browser cache */ }
+    return true
+  }, [apiUrl, getApiPrefix, getAuthHeaders])
 
   // 加载令牌分组列表
   const fetchTokenGroups = useCallback(async () => {
@@ -620,72 +544,40 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     localStorage.setItem(REFRESH_INTERVAL_KEY, refreshInterval.toString())
   }, [refreshInterval])
 
-  // Fetch available models and load config
+  // Candidate discovery never changes or automatically saves the selection.
   const fetchAvailableModels = useCallback(async () => {
+    const requestId = ++configRequestRef.current
+    setConfigLoaded(false)
     try {
-      const response = await fetch(`${apiUrl}${getApiPrefix()}/models`, {
-        headers: getAuthHeaders(),
-      })
+      if (!await loadConfigFromBackend(requestId)) return
+      const response = await fetch(`${apiUrl}${getApiPrefix()}/models`, { headers: getAuthHeaders() })
       const data = await response.json()
-      if (data.success) {
-        // data.data is now an array of { model_name, request_count_24h }
-        // 后端无数据时可能返回 null（Go nil 切片 → JSON null），统一兜底成数组，避免渲染崩溃
-        const models: ModelWithStats[] = Array.isArray(data.data) ? data.data : []
-        setAvailableModels(models)
-        // Load config from backend
-        const savedModels = await loadConfigFromBackend()
-        // Auto-select models with requests in last 24h if none selected
-        if (savedModels.length === 0 && models.length > 0) {
-          // Filter models that have requests in the last 24 hours
-          const activeModels = models
-            .filter((m: ModelWithStats) => m.request_count_24h > 0)
-            .map((m: ModelWithStats) => m.model_name)
-          // If no active models, fall back to first 5
-          const defaultModels = activeModels.length > 0
-            ? activeModels
-            : models.slice(0, 5).map((m: ModelWithStats) => m.model_name)
-          setSelectedModels(defaultModels)
-          saveSelectedModelsToBackend(defaultModels)
-        }
-        // 库里一个模型都没有时不会触发任何状态请求，必须在这里收掉加载态，
-        // 否则骨架屏会永远显示（fetchModelStatuses 的空分支只在有模型时清 initialLoading）
-        if (models.length === 0) {
-          setLoading(false)
-          setInitialLoading(false)
-        }
-      }
-      // 同时加载令牌分组
+      if (requestId !== configRequestRef.current) return
+      if (!response.ok || !data.success) throw new Error('获取候选模型失败')
+      setAvailableModels(Array.isArray(data.data) ? data.data : [])
       fetchTokenGroups()
     } catch (error) {
-      console.error('Failed to fetch available models:', error)
-      // 模型列表拉取失败同样要收掉加载态，避免骨架屏卡死
-      setLoading(false)
-      setInitialLoading(false)
+      if (requestId === configRequestRef.current) setConfigError(error instanceof Error ? error.message : '加载模型配置失败')
+    } finally {
+      if (requestId === configRequestRef.current) {
+        setLoading(false)
+        setInitialLoading(false)
+      }
     }
-  }, [apiUrl, getApiPrefix, getAuthHeaders, loadConfigFromBackend, saveSelectedModelsToBackend, fetchTokenGroups])
+  }, [apiUrl, getApiPrefix, getAuthHeaders, loadConfigFromBackend, fetchTokenGroups])
 
   // Fetch model statuses
   // forceRefresh: bypass cache to get fresh data (used for manual refresh)
   const fetchModelStatuses = useCallback(async (forceRefresh = false) => {
-    // 计算实际要请求状态的模型集合：
-    //   - 用户手工选中的 selectedModels（基础）
-    //   - 当前过滤器若为某个密钥分组（token:X），把该分组下的全部模型并入
-    // 这样选中密钥分组时，分组下所有模型会自动出现在监控视图中，无需手动勾选。
-    const tokenGroupModels = (() => {
-      if (!groupFilter.startsWith('token:')) return [] as string[]
-      const name = groupFilter.slice(6)
-      const tg = tokenGroups.find(g => g.group_name === name)
-      return tg ? tg.models : []
-    })()
-    const fetchSet = Array.from(new Set([...selectedModels, ...tokenGroupModels]))
+    if (!configLoaded) return
+    const requestId = ++statusRequestRef.current
+    const fetchSet = selectedModels
 
     if (fetchSet.length === 0) {
       setModelStatuses([])
       setLoading(false)
-      // Only clear initialLoading when we know models have been loaded
-      if (availableModels.length > 0) {
-        setInitialLoading(false)
-      }
+      setRefreshing(false)
+      setInitialLoading(false)
       return
     }
 
@@ -702,67 +594,34 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
         body: JSON.stringify(fetchSet),
       })
       const data = await response.json()
-      if (data.success) {
-        setModelStatuses(data.data ?? [])
-        setInitialLoading(false)
-      }
+      if (requestId !== statusRequestRef.current) return
+      if (!response.ok || !data.success) throw new Error('获取模型状态失败')
+      setModelStatuses(data.data ?? [])
+      setInitialLoading(false)
     } catch (error) {
+      if (requestId !== statusRequestRef.current) return
       console.error('Failed to fetch model statuses:', error)
-      if (!isEmbed) {
-        showToast('error', '获取模型状态失败')
-      }
+      if (!isEmbed) showToast('error', '获取模型状态失败')
     } finally {
-      setLoading(false)
-      setRefreshing(false)
+      if (requestId === statusRequestRef.current) {
+        setLoading(false)
+        setRefreshing(false)
+      }
     }
-  }, [apiUrl, getApiPrefix, getAuthHeaders, selectedModels, timeWindow, isEmbed, showToast, groupFilter, tokenGroups, availableModels.length])
+  }, [apiUrl, getApiPrefix, getAuthHeaders, selectedModels, timeWindow, isEmbed, showToast, configLoaded])
 
   // Initial load
   useEffect(() => {
     fetchAvailableModels()
+    const requestRef = configRequestRef
+    return () => { requestRef.current++ }
   }, [fetchAvailableModels])
 
-  // Track if models/window changed (not initial load)
-  const isInitialMount = useRef(true)
-  const prevSelectedModels = useRef<string[]>([])
-  const prevTimeWindow = useRef<string>(timeWindow)
-  const prevGroupFilter = useRef<string>(groupFilter)
-
-  // Handle model selection and time window changes
   useEffect(() => {
-    if (isInitialMount.current) {
-      // Initial load - use cache for fast loading
-      isInitialMount.current = false
-      prevSelectedModels.current = selectedModels
-      prevTimeWindow.current = timeWindow
-      prevGroupFilter.current = groupFilter
-      fetchModelStatuses(false)  // Use cache on initial load
-      return
-    }
-
-    // Check what changed
-    const modelsChanged =
-      selectedModels.length !== prevSelectedModels.current.length ||
-      selectedModels.some(m => !prevSelectedModels.current.includes(m))
-    const windowChanged = timeWindow !== prevTimeWindow.current
-    // 切到/切出某个密钥分组时也要重新拉取，因为请求集合包含分组成员
-    const groupFilterChanged = groupFilter !== prevGroupFilter.current
-    const tokenGroupSwitched =
-      groupFilterChanged && (groupFilter.startsWith('token:') || prevGroupFilter.current.startsWith('token:'))
-
-    // Update refs
-    prevSelectedModels.current = selectedModels
-    prevTimeWindow.current = timeWindow
-    prevGroupFilter.current = groupFilter
-
-    if (modelsChanged || tokenGroupSwitched) {
-      // Models selection changed - fetch fresh data for new models
-      fetchModelStatuses(true)
-    } else if (windowChanged) {
-      // Only time window changed - can use cache (pre-warmed)
-      fetchModelStatuses(false)
-    }
-  }, [selectedModels, timeWindow, groupFilter, fetchModelStatuses])
+    fetchModelStatuses()
+    const requestRef = statusRequestRef
+    return () => { requestRef.current++ }
+  }, [fetchModelStatuses])
 
   // Auto refresh countdown
   useEffect(() => {
@@ -804,44 +663,18 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     })
   )
 
-  // Status counts for overview
-  const statusCounts = useMemo(() => {
-    const counts = { green: 0, yellow: 0, red: 0 }
-    modelStatuses.forEach(m => {
-      counts[m.current_status]++
-    })
-    return counts
-  }, [modelStatuses])
-
-  // Group counts for custom group filter tabs
-  const groupCounts = useMemo(() => {
-    const counts: Record<string, number> = { all: 0 }
-    customGroups.forEach(g => { counts[g.id] = 0 })
-    tokenGroups.forEach(g => { counts[`token:${g.group_name}`] = 0 })
-    // Count only models that are actually displayed (with requests > 0)
-    const visibleModels = modelStatuses.filter(m => m.total_requests > 0)
-    counts.all = visibleModels.length
-    visibleModels.forEach(m => {
-      customGroups.forEach(g => {
-        if (modelMatchesGroup(m.model_name, g)) {
-          counts[g.id] = (counts[g.id] || 0) + 1
-        }
-      })
-      tokenGroups.forEach(g => {
-        if (g.models.includes(m.model_name)) {
-          counts[`token:${g.group_name}`] = (counts[`token:${g.group_name}`] || 0) + 1
-        }
-      })
-    })
-    return counts
-  }, [modelStatuses, customGroups, tokenGroups])
+  const monitoredModels = useMemo(() => selectedModelStatuses(selectedModels, modelStatuses, timeWindow), [selectedModels, modelStatuses, timeWindow])
+  const groupedModels = useMemo(() => filterModelGroup(monitoredModels, groupFilter, customGroups, tokenGroups), [monitoredModels, groupFilter, customGroups, tokenGroups])
+  const statusCounts = useMemo(() => modelStatusCounts(groupedModels), [groupedModels])
+  const groupCounts = useMemo(() => modelGroupCounts(monitoredModels, customGroups, tokenGroups), [monitoredModels, customGroups, tokenGroups])
+  const selectableModels = useMemo(() => mergeSelectableModels(availableModels, [...selectedModels, ...draftModels]), [availableModels, selectedModels, draftModels])
 
   // Average success rate
   const avgSuccessRate = useMemo(() => {
-    const active = modelStatuses.filter(m => m.total_requests > 0)
-    if (active.length === 0) return 0
+    const active = groupedModels.filter(m => m.total_requests > 0)
+    if (active.length === 0) return null
     return +(active.reduce((sum, m) => sum + m.success_rate, 0) / active.length).toFixed(1)
-  }, [modelStatuses])
+  }, [groupedModels])
 
   // Handle group filter change
   const handleGroupFilterChange = useCallback((gid: string) => {
@@ -879,69 +712,13 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
   // Select all models in a group
   const selectGroupModels = useCallback((group: CustomModelGroup) => {
-    const newModels = [...new Set([...selectedModels, ...group.models.filter(m => availableModels.some(a => a.model_name === m))])]
-    setSelectedModels(newModels)
-    saveSelectedModelsToBackend(newModels)
-  }, [selectedModels, availableModels, saveSelectedModelsToBackend])
+    setDraftModels(previous => [...new Set([...previous, ...selectableModels.filter(model => modelMatchesGroup(model.model_name, group)).map(model => model.model_name)])])
+  }, [selectableModels])
 
   // Sorted model statuses based on sort mode
-  const sortedModelStatuses = useMemo(() => {
-    if (modelStatuses.length === 0) return []
-
-    let result: ModelStatus[]
-    switch (sortMode) {
-      case 'availability':
-        // Sort by success rate descending
-        result = [...modelStatuses].sort((a, b) => b.success_rate - a.success_rate)
-        break
-      case 'custom':
-        if (customOrder.length === 0) {
-          result = modelStatuses
-        } else {
-          // Sort by custom order
-          result = [...modelStatuses].sort((a, b) => {
-            const indexA = customOrder.indexOf(a.model_name)
-            const indexB = customOrder.indexOf(b.model_name)
-            // Models not in customOrder go to the end
-            if (indexA === -1 && indexB === -1) return 0
-            if (indexA === -1) return 1
-            if (indexB === -1) return -1
-            return indexA - indexB
-          })
-        }
-        break
-      default:
-        result = modelStatuses
-    }
-
-    // Hide models with 0 requests
-    result = result.filter(m => m.total_requests > 0)
-
-    // Apply group filter
-    if (groupFilter !== 'all') {
-      if (groupFilter.startsWith('token:')) {
-        // 令牌分组过滤
-        const tokenGroupName = groupFilter.slice(6)
-        const tg = tokenGroups.find(g => g.group_name === tokenGroupName)
-        if (tg) {
-          result = result.filter(m => tg.models.includes(m.model_name))
-        }
-      } else {
-        // 自定义分组过滤（精确名 + 厂商关键字模糊匹配）
-        const group = customGroups.find(g => g.id === groupFilter)
-        if (group) {
-          result = result.filter(m => modelMatchesGroup(m.model_name, group))
-        }
-      }
-    }
-
-    // Apply status filter
-    if (statusFilter !== 'all') {
-      result = result.filter(m => m.current_status === statusFilter)
-    }
-
-    return result
-  }, [modelStatuses, sortMode, customOrder, statusFilter, groupFilter, customGroups, tokenGroups])
+  const sortedModelStatuses = useMemo(() =>
+    filterModelStatus(sortModelStatuses(groupedModels, sortMode, customOrder), statusFilter),
+  [groupedModels, sortMode, customOrder, statusFilter])
 
   // Handle drag end for reordering
   const handleDragEnd = (event: DragEndEvent) => {
@@ -974,22 +751,15 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   }
 
   const toggleModelSelection = (model: string) => {
-    const newModels = selectedModels.includes(model)
-      ? selectedModels.filter(m => m !== model)
-      : [...selectedModels, model]
-    setSelectedModels(newModels)
-    saveSelectedModelsToBackend(newModels)
+    setDraftModels(previous => previous.includes(model) ? previous.filter(name => name !== model) : [...previous, model])
   }
 
   const selectAllModels = () => {
-    const allModelNames = availableModels.map(m => m.model_name)
-    setSelectedModels(allModelNames)
-    saveSelectedModelsToBackend(allModelNames)
+    setDraftModels(selectableModels.map(model => model.model_name))
   }
 
   const clearAllModels = () => {
-    setSelectedModels([])
-    saveSelectedModelsToBackend([])
+    setDraftModels([])
   }
 
   if (loading && modelStatuses.length === 0) {
@@ -1077,17 +847,18 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                 </div>
                 <p className="text-sm text-muted-foreground mt-2 flex items-center flex-wrap gap-x-3 gap-y-1">
                   <span>监控 <span className="font-semibold text-foreground">{selectedModels.length}</span> 个模型</span>
-                  {modelStatuses.length > 0 && (
+                  {monitoredModels.length > 0 && (
                     <>
                       <span className="text-muted-foreground/40">·</span>
-                      <span>总请求 <span className="font-semibold text-foreground tabular-nums">{modelStatuses.reduce((sum, m) => sum + m.total_requests, 0).toLocaleString()}</span></span>
+                      <span>总请求 <span className="font-semibold text-foreground tabular-nums">{groupedModels.reduce((sum, model) => sum + model.total_requests, 0).toLocaleString()}</span></span>
                       <span className="text-muted-foreground/40">·</span>
-                      <span>平均成功率 <span className={cn("font-semibold tabular-nums", avgSuccessRate >= 95 ? 'text-green-600' : avgSuccessRate >= 80 ? 'text-yellow-600' : 'text-red-600')}>{avgSuccessRate}%</span></span>
+                      <span>平均成功率 <span className={cn("font-semibold tabular-nums", avgSuccessRate === null ? 'text-muted-foreground' : avgSuccessRate >= 95 ? 'text-green-600' : avgSuccessRate >= 80 ? 'text-yellow-600' : 'text-red-600')}>{avgSuccessRate === null ? '—' : `${avgSuccessRate}%`}</span></span>
                       <span className="text-muted-foreground/40">·</span>
                       <span className="flex items-center gap-1.5">
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500" /><span className="font-medium text-green-600 tabular-nums">{statusCounts.green}</span></span>
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-yellow-500" /><span className="font-medium text-yellow-600 tabular-nums">{statusCounts.yellow}</span></span>
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500" /><span className="font-medium text-red-600 tabular-nums">{statusCounts.red}</span></span>
+                        <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-400" />无数据 <span className="tabular-nums">{statusCounts.empty}</span></span>
                       </span>
                     </>
                   )}
@@ -1189,7 +960,14 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setShowModelSelector(!showModelSelector)}
+                  disabled={savingSelection || !configLoaded}
+                  onClick={() => {
+                    if (!showModelSelector) {
+                      setDraftModels(selectedModels)
+                      setSelectionError('')
+                    }
+                    setShowModelSelector(!showModelSelector)
+                  }}
                   className="h-9"
                 >
                   <Settings2 className="h-4 w-4 mr-2" />
@@ -1199,8 +977,9 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
                 {showModelSelector && (
                   <div className="absolute right-0 mt-1 w-80 bg-popover border rounded-md shadow-lg z-40 max-h-[520px] flex flex-col overflow-hidden">
+                    <fieldset disabled={savingSelection} className="contents">
                     <div className="p-2 border-b flex justify-between items-center">
-                      <p className="text-xs text-muted-foreground">选择要监控的模型</p>
+                      <p className="text-xs text-muted-foreground">已选 {draftModels.length} 个{!sameModels(draftModels, selectedModels) && ' · 未保存'}</p>
                       <div className="flex gap-1">
                         <Button variant="ghost" size="sm" className="h-6 text-xs" onClick={selectAllModels}>
                           全选
@@ -1209,8 +988,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                           const activeModels = availableModels
                             .filter(m => m.request_count_24h > 0)
                             .map(m => m.model_name)
-                          setSelectedModels(activeModels)
-                          saveSelectedModelsToBackend(activeModels)
+                          setDraftModels(activeModels)
                         }}>
                           有记录
                         </Button>
@@ -1225,17 +1003,16 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                         <p className="text-xs text-muted-foreground mb-1.5">按分组选择</p>
                         <div className="flex flex-wrap gap-1">
                           {customGroups.map((group) => {
-                            const groupModelCount = group.models.filter(m => availableModels.some(a => a.model_name === m)).length
-                            const selectedInGroup = group.models.filter(m => selectedModels.includes(m)).length
+                            const groupModels = selectableModels.filter(model => modelMatchesGroup(model.model_name, group)).map(model => model.model_name)
+                            const groupModelCount = groupModels.length
+                            const selectedInGroup = groupModels.filter(model => draftModels.includes(model)).length
                             const allSelected = selectedInGroup === groupModelCount && groupModelCount > 0
                             return (
                               <button
                                 key={group.id}
                                 onClick={() => {
                                   if (allSelected) {
-                                    const newModels = selectedModels.filter(m => !group.models.includes(m))
-                                    setSelectedModels(newModels)
-                                    saveSelectedModelsToBackend(newModels)
+                                    setDraftModels(previous => previous.filter(model => !groupModels.includes(model)))
                                   } else {
                                     selectGroupModels(group)
                                   }
@@ -1273,15 +1050,16 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                       </div>
                     </div>
                     <div className="p-1 flex-1 min-h-0 overflow-y-auto">
-                      {availableModels
+                      {selectableModels
                         .filter(model => !modelSearchQuery || model.model_name.toLowerCase().includes(modelSearchQuery.toLowerCase()))
                         .map(model => (
                           <button
                             key={model.model_name}
                             onClick={() => toggleModelSelection(model.model_name)}
+                            aria-pressed={draftModels.includes(model.model_name)}
                             className={cn(
                               "w-full text-left px-3 py-2 text-sm rounded hover:bg-accent transition-colors flex items-center justify-between",
-                              selectedModels.includes(model.model_name) && "bg-accent"
+                              draftModels.includes(model.model_name) && "bg-accent"
                             )}
                           >
                             <div className="flex items-center gap-2 min-w-0">
@@ -1303,17 +1081,26 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                               ) : (
                                 <span className="text-xs text-orange-400">无请求</span>
                               )}
-                              {selectedModels.includes(model.model_name) && (
+                              {draftModels.includes(model.model_name) && (
                                 <Check className="h-4 w-4 text-primary" />
                               )}
                             </div>
                           </button>
                         ))}
-                      {availableModels.filter(m => !modelSearchQuery || m.model_name.toLowerCase().includes(modelSearchQuery.toLowerCase())).length === 0 && (
+                      {selectableModels.filter(m => !modelSearchQuery || m.model_name.toLowerCase().includes(modelSearchQuery.toLowerCase())).length === 0 && (
                         <p className="text-sm text-muted-foreground text-center py-4">
                           {modelSearchQuery ? '未找到匹配的模型' : '暂无可用模型'}
                         </p>
                       )}
+                    </div>
+                    </fieldset>
+                    <div className="p-2 border-t space-y-2">
+                      <p className="text-xs text-muted-foreground">公开页只显示已保存名单；无请求的已选模型也会保留。</p>
+                      {selectionError && <p role="alert" className="text-xs text-red-600">{selectionError}</p>}
+                      <Button size="sm" className="w-full" disabled={savingSelection} onClick={() => saveSelectedModelsToBackend()}>
+                        {savingSelection && <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />}
+                        {savingSelection ? '保存并校验中…' : '保存并同步'}
+                      </Button>
                     </div>
                   </div>
                 )}
@@ -1458,13 +1245,20 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
         </div>
       </Card>
 
+      {configError && (
+        <div role="alert" className="flex items-center gap-3 rounded-md border border-destructive/30 p-3 text-sm text-destructive">
+          <span>{configError}，请重新读取配置后再修改名单。</span>
+          <Button variant="outline" size="sm" disabled={savingSelection} onClick={() => fetchAvailableModels()}>重新读取</Button>
+        </div>
+      )}
+
       {/* Embed Help Modal */}
       {showEmbedHelp && (
         <EmbedHelpModal onClose={() => setShowEmbedHelp(false)} />
       )}
 
       {/* Group Filter + Status Filter */}
-      {modelStatuses.length > 0 && (
+      {monitoredModels.length > 0 && (
         <div className="space-y-3">
           {/* Model Group Filter */}
           <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-hide">
@@ -1553,13 +1347,14 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
           </div>
 
           {/* Status Filter Tabs */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 overflow-x-auto">
             <Filter className="h-4 w-4 text-muted-foreground" />
             {[
-              { value: 'all' as StatusFilter, label: '全部', count: modelStatuses.length },
+              { value: 'all' as StatusFilter, label: '全部', count: groupedModels.length },
               { value: 'green' as StatusFilter, label: '正常', count: statusCounts.green, color: 'text-green-600' },
               { value: 'yellow' as StatusFilter, label: '警告', count: statusCounts.yellow, color: 'text-yellow-600' },
               { value: 'red' as StatusFilter, label: '异常', count: statusCounts.red, color: 'text-red-600' },
+              { value: 'empty' as StatusFilter, label: '无数据', count: statusCounts.empty },
             ].map(tab => (
               <button
                 key={tab.value}
@@ -1588,7 +1383,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       {showGroupManager && (
         <GroupManagerModal
           groups={customGroups}
-          allModels={modelStatuses.filter(m => m.total_requests > 0).map(m => m.model_name)}
+          allModels={selectedModels}
           onSave={(groups) => {
             saveCustomGroups(groups)
             // Reset filter if the active group was deleted
@@ -1658,12 +1453,12 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       ) : (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
-            {availableModels.length === 0 ? (
-              <p>暂无可用模型：NewAPI 还没有模型调用记录，产生调用日志后这里会自动出现</p>
+            {!configLoaded ? (
+              <p>模型名单尚未加载，请重新读取配置</p>
             ) : selectedModels.length === 0 ? (
-              <p>请选择要监控的模型</p>
+              <p>尚未选择监控模型，请在“选择模型”中勾选并保存</p>
             ) : (
-              <p>暂无模型状态数据</p>
+              <p>当前筛选条件下没有模型</p>
             )}
           </CardContent>
         </Card>
@@ -2327,7 +2122,8 @@ function ModelStatusCard({ model, dragHandleProps }: ModelStatusCardProps) {
   const timeLabels = getTimeLabels()
 
   // Success rate color based on status
-  const rateColorClass = model.current_status === 'green' ? 'text-green-600 dark:text-green-400'
+  const hasData = model.total_requests > 0
+  const rateColorClass = !hasData ? 'text-muted-foreground' : model.current_status === 'green' ? 'text-green-600 dark:text-green-400'
     : model.current_status === 'yellow' ? 'text-yellow-600 dark:text-yellow-400'
       : 'text-red-600 dark:text-red-400'
 
@@ -2359,13 +2155,13 @@ function ModelStatusCard({ model, dragHandleProps }: ModelStatusCardProps) {
             {model.model_name}
           </span>
           <Badge
-            variant={model.current_status === 'green' ? 'success' : model.current_status === 'yellow' ? 'warning' : 'destructive'}
+            variant={!hasData ? 'secondary' : model.current_status === 'green' ? 'success' : model.current_status === 'yellow' ? 'warning' : 'destructive'}
             className="text-[10px] px-1.5 py-0 h-5 flex-shrink-0"
           >
-            {STATUS_LABELS[model.current_status]}
+            {hasData ? STATUS_LABELS[model.current_status] : '无数据'}
           </Badge>
           <div className="ml-auto text-xs text-muted-foreground flex-shrink-0 tabular-nums">
-            <span className={cn("font-semibold", rateColorClass)}>{model.success_rate}%</span>
+            <span className={cn("font-semibold", rateColorClass)}>{hasData ? `${model.success_rate}%` : '—'}</span>
             <span className="mx-1 text-muted-foreground/40">·</span>
             <span>{model.total_requests.toLocaleString()}</span>
           </div>

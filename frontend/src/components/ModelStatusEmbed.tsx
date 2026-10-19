@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { cn } from '../lib/utils'
+import { readSelectionConfig, sameModels, selectedModelStatuses, modelGroupCounts, filterModelGroup, modelStatusCounts, sortModelStatuses } from '../lib/model-status'
+import type { ModelStatus, SlotStatus, SortMode } from '../lib/model-status'
 import { Loader2, Timer, Activity, Zap, Sun, Moon, Minimize2, Terminal, Leaf, Droplets, Command, LayoutGrid, Bot, MessageSquareQuote, Triangle, Sparkles, CreditCard, GitBranch, Gamepad2, Rocket, Brain, Layers, Tag, KeyRound, ChevronDown } from 'lucide-react'
 import {
   OpenAI, Gemini, DeepSeek, SiliconCloud, Groq, Ollama, Claude, Mistral,
@@ -12,27 +14,6 @@ import {
 // ============================================================================
 // Types
 // ============================================================================
-
-interface SlotStatus {
-  slot: number
-  start_time: number
-  end_time: number
-  total_requests: number
-  success_count: number
-  success_rate: number
-  status: 'green' | 'yellow' | 'red'
-}
-
-interface ModelStatus {
-  model_name: string
-  display_name: string
-  time_window: string
-  total_requests: number
-  success_count: number
-  success_rate: number
-  current_status: 'green' | 'yellow' | 'red'
-  slot_data: SlotStatus[]
-}
 
 type ThemeId = 'obsidian' | 'daylight' | 'minimal' | 'neon' | 'forest' | 'ocean' | 'terminal' | 'cupertino' | 'material' | 'openai' | 'anthropic' | 'vercel' | 'linear' | 'stripe' | 'github' | 'discord' | 'tesla'
 
@@ -51,46 +32,6 @@ interface EmbedCustomGroup {
   name: string
   icon?: string
   models: string[]
-}
-
-// 厂商关键字映射：vendor 分组配置了 icon 时，名字含这些关键字的模型自动归入。
-const EMBED_VENDOR_KEYWORDS: Record<string, string[]> = {
-  openai: ['gpt', 'openai', 'o1', 'o3', 'chatgpt', 'dall-e', 'whisper', 'tts'],
-  claude: ['claude', 'anthropic'],
-  gemini: ['gemini', 'gemma', 'bard'],
-  deepseek: ['deepseek'],
-  meta: ['llama', 'meta'],
-  mistral: ['mistral', 'mixtral', 'codestral', 'pixtral'],
-  qwen: ['qwen', 'tongyi'],
-  zhipu: ['glm', 'chatglm', 'zhipu'],
-  moonshot: ['moonshot', 'kimi'],
-  kimi: ['kimi', 'moonshot'],
-  doubao: ['doubao', 'bytedance'],
-  minimax: ['minimax', 'abab'],
-  baichuan: ['baichuan'],
-  yi: ['yi-', '01-ai', 'zero-one'],
-  spark: ['spark', 'xunfei'],
-  hunyuan: ['hunyuan', 'tencent'],
-  stepfun: ['stepfun', 'step-'],
-  wenxin: ['wenxin', 'ernie', 'baidu'],
-  cohere: ['cohere', 'command'],
-  perplexity: ['perplexity', 'pplx', 'sonar'],
-  groq: ['groq'],
-  ollama: ['ollama'],
-  together: ['together'],
-  openrouter: ['openrouter'],
-  siliconcloud: ['siliconcloud', 'silicon'],
-  coze: ['coze'],
-  cerebras: ['cerebras'],
-}
-
-function embedModelMatchesGroup(modelName: string, group: EmbedCustomGroup): boolean {
-  if (group.models.includes(modelName)) return true
-  if (!group.icon) return false
-  const keywords = EMBED_VENDOR_KEYWORDS[group.icon]
-  if (!keywords) return false
-  const lower = modelName.toLowerCase()
-  return keywords.some(k => lower.includes(k))
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -885,6 +826,11 @@ export function ModelStatusEmbed({
   const [tokenGroups, setTokenGroups] = useState<EmbedTokenGroup[]>([])
   const [groupFilter, setGroupFilter] = useState('all')
   const [siteTitle, setSiteTitle] = useState('')
+  const [sortMode, setSortMode] = useState<SortMode>('default')
+  const [customOrder, setCustomOrder] = useState<string[]>([])
+  const [syncError, setSyncError] = useState('')
+  const refreshRequestRef = useRef(0)
+  const statusConfigRef = useRef<{ models: string[]; timeWindow: string } | null>(null)
 
   // Tooltip state - lifted to parent to avoid z-index/transform issues
   const [hoveredSlot, setHoveredSlot] = useState<SlotStatus | null>(null)
@@ -902,143 +848,98 @@ export function ModelStatusEmbed({
     }
   }, [])
 
-  // Load config from backend
-  const loadConfig = useCallback(async () => {
+  // Every refresh reads the authoritative list before requesting any status data.
+  const refreshData = useCallback(async (configOnly = false) => {
+    const requestId = ++refreshRequestRef.current
     try {
-      const response = await fetch(`${apiUrl}/api/model-status/embed/config/selected`)
-      const data = await response.json()
-      if (data.success) {
-        if (Array.isArray(data.data) && data.data.length > 0) {
-          setSelectedModels(data.data)
-        }
-        if (data.time_window) {
-          setTimeWindow(data.time_window)
-        }
-        // Load refresh interval from backend
-        if (data.refresh_interval !== undefined && data.refresh_interval !== null) {
-          setRefreshInterval(data.refresh_interval)
-          setCountdown(data.refresh_interval)
-        }
-        // Load theme from backend if not overridden by URL
-        const urlParams = new URLSearchParams(window.location.search)
-        if (!urlParams.get('theme') && data.theme) {
-          // Validate theme exists in themeStyles, fallback to daylight for legacy values
-          const validTheme = THEMES.find(t => t.id === data.theme) ? data.theme : 'daylight'
-          setTheme(validTheme as ThemeId)
-        }
-        // Load custom groups
-        if (data.custom_groups && Array.isArray(data.custom_groups)) {
-          setCustomGroups(data.custom_groups as EmbedCustomGroup[])
-        }
-        // Load site title
-        if (data.site_title) {
-          setSiteTitle(data.site_title)
-        }
-        // 加载令牌分组
-        try {
-          const tgResponse = await fetch(`${apiUrl}/api/model-status/embed/token-groups`)
-          const tgData = await tgResponse.json()
-          if (tgData.success && Array.isArray(tgData.data)) {
-            setTokenGroups(tgData.data)
-          }
-        } catch {
-          // 令牌分组加载失败不影响主流程
-        }
-        return data.data || []
+      const config = await readSelectionConfig(`${apiUrl}/api/model-status/embed/config/selected`)
+      if (requestId !== refreshRequestRef.current) return
+      setSelectedModels(previous => sameModels(previous, config.data) ? previous : config.data)
+      const window = config.time_window || '24h'
+      const previous = statusConfigRef.current
+      const statusConfigChanged = !previous || !sameModels(previous.models, config.data) || previous.timeWindow !== window
+      if (statusConfigChanged) statusConfigRef.current = null
+      setModelStatuses(previousStatuses => statusConfigChanged ? [] : previousStatuses.filter(model => config.data.includes(model.model_name)))
+      setTimeWindow(window)
+      if (config.refresh_interval !== undefined) setRefreshInterval(config.refresh_interval)
+      const urlTheme = new URLSearchParams(globalThis.location.search).get('theme')
+      if (!urlTheme && config.theme) {
+        setTheme(THEMES.find(theme => theme.id === config.theme) ? config.theme as ThemeId : 'daylight')
       }
-    } catch (error) {
-      console.error('Failed to load config from backend:', error)
+      setSortMode(config.sort_mode || 'default')
+      setCustomOrder(config.custom_order || [])
+      setCustomGroups(config.custom_groups || [])
+      setSiteTitle(config.site_title || '')
+      const shouldFetchStatus = !configOnly || (config.refresh_interval ?? defaultRefreshInterval) > 0 || statusConfigChanged
+      if (config.data.length === 0) {
+        setModelStatuses([])
+        statusConfigRef.current = { models: [], timeWindow: window }
+      } else if (shouldFetchStatus) {
+        const response = await fetch(`${apiUrl}/api/model-status/embed/status/batch?window=${window}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(config.data),
+        })
+        const data = await response.json()
+        if (requestId !== refreshRequestRef.current) return
+        if (!response.ok || !data.success) throw new Error('获取模型状态失败')
+        setModelStatuses(data.data ?? [])
+        statusConfigRef.current = { models: config.data, timeWindow: window }
+      }
+      setSyncError('')
+      if (shouldFetchStatus || config.data.length === 0) setLastUpdate(new Date())
+    } catch {
+      if (requestId === refreshRequestRef.current) setSyncError('同步失败，当前数据可能不是最新，请稍后重试')
+    } finally {
+      if (requestId === refreshRequestRef.current) setLoading(false)
     }
-    return []
+  }, [apiUrl, defaultRefreshInterval])
+
+  useEffect(() => {
+    refreshData()
+    const requestRef = refreshRequestRef
+    return () => { requestRef.current++ }
+  }, [refreshData])
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${apiUrl}/api/model-status/embed/token-groups`)
+      .then(response => response.json())
+      .then(data => {
+        if (!cancelled && data.success && Array.isArray(data.data)) setTokenGroups(data.data)
+      })
+      .catch(() => { /* group filters are optional */ })
+    return () => { cancelled = true }
   }, [apiUrl])
 
+  // Keep configuration in sync even when automatic status refresh was disabled.
   useEffect(() => {
-    loadConfig()
-  }, [loadConfig])
-
-  // Fetch model statuses
-  // Embed page always uses cache to reduce database load
-  const fetchModelStatuses = useCallback(async () => {
-    // 选中某个密钥分组时，自动把分组下全部模型并入请求集合，
-    // 用户无需手工把每个模型加进监控列表也能看到分组下的状态。
-    const tokenGroupModels = (() => {
-      if (!groupFilter.startsWith('token:')) return [] as string[]
-      const name = groupFilter.slice(6)
-      const tg = tokenGroups.find(g => g.group_name === name)
-      return tg ? tg.models : []
-    })()
-    const fetchSet = Array.from(new Set([...selectedModels, ...tokenGroupModels]))
-
-    if (fetchSet.length === 0) {
-      setModelStatuses([])
-      setLoading(false)
-      return
-    }
-
-    try {
-      const response = await fetch(`${apiUrl}/api/model-status/embed/status/batch?window=${timeWindow}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(fetchSet),
-      })
-      const data = await response.json()
-      if (data.success) {
-        setModelStatuses(data.data ?? [])
-        setLastUpdate(new Date())
-      }
-    } catch (error) {
-      console.error('Failed to fetch model statuses:', error)
-    } finally {
-      setLoading(false)
-    }
-  }, [apiUrl, selectedModels, timeWindow, groupFilter, tokenGroups])
-
-  useEffect(() => {
-    fetchModelStatuses()
-  }, [fetchModelStatuses])
-
-  // Auto refresh with visibility change handling
-  // When page is in background, browser throttles setInterval
-  // So we refresh immediately when page becomes visible again
-  useEffect(() => {
-    if (refreshInterval <= 0) return
-
+    const interval = refreshInterval > 0 ? refreshInterval : 60
     let lastRefreshTime = Date.now()
-
-    const timer = setInterval(() => {
-      setCountdown(prev => {
-        if (prev <= 1) {
-          fetchModelStatuses()
-          lastRefreshTime = Date.now()
-          return refreshInterval
-        }
-        return prev - 1
-      })
-    }, 1000)
-
-    // Handle page visibility change
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        const elapsed = Math.floor((Date.now() - lastRefreshTime) / 1000)
-        if (elapsed >= refreshInterval) {
-          // Enough time has passed, refresh immediately
-          fetchModelStatuses()
-          lastRefreshTime = Date.now()
-          setCountdown(refreshInterval)
-        } else {
-          // Update countdown to reflect actual remaining time
-          setCountdown(Math.max(1, refreshInterval - elapsed))
-        }
+    setCountdown(interval)
+    const tick = () => {
+      const elapsed = Math.floor((Date.now() - lastRefreshTime) / 1000)
+      if (elapsed >= interval) {
+        refreshData(refreshInterval === 0)
+        lastRefreshTime = Date.now()
+        setCountdown(interval)
+      } else {
+        setCountdown(Math.max(1, interval - elapsed))
       }
     }
-
-    document.addEventListener('visibilitychange', handleVisibilityChange)
-
+    const timer = setInterval(tick, 1000)
+    const handleVisibility = () => { if (document.visibilityState === 'visible') tick() }
+    document.addEventListener('visibilitychange', handleVisibility)
     return () => {
       clearInterval(timer)
-      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      document.removeEventListener('visibilitychange', handleVisibility)
     }
-  }, [refreshInterval, fetchModelStatuses])
+  }, [refreshInterval, refreshData])
+
+  const monitoredModels = useMemo(() => selectedModelStatuses(selectedModels, modelStatuses, timeWindow), [selectedModels, modelStatuses, timeWindow])
+  const groupedModels = useMemo(() => filterModelGroup(monitoredModels, groupFilter, customGroups, tokenGroups), [monitoredModels, groupFilter, customGroups, tokenGroups])
+  const displayedModels = useMemo(() => sortModelStatuses(groupedModels, sortMode, customOrder), [groupedModels, sortMode, customOrder])
+  const groupCountMap = useMemo(() => modelGroupCounts(monitoredModels, customGroups, tokenGroups), [monitoredModels, customGroups, tokenGroups])
 
   // Handler for hover
   const handleSlotHover = (slot: SlotStatus, rect: DOMRect) => {
@@ -1107,14 +1008,14 @@ export function ModelStatusEmbed({
           )}
         </div>
 
+        {syncError && <p role="alert" className={cn('mb-4 text-sm', styles.statsText)}>{syncError}</p>}
+
         {/* Stats Overview Bar */}
-        {modelStatuses.length > 0 && theme !== 'minimal' && (() => {
-          const totalRequests = modelStatuses.reduce((sum, m) => sum + m.total_requests, 0)
-          const activeModels = modelStatuses.filter(m => m.total_requests > 0)
-          const avgRate = activeModels.length > 0 ? +(activeModels.reduce((sum, m) => sum + m.success_rate, 0) / activeModels.length).toFixed(1) : 0
-          const greenCount = modelStatuses.filter(m => m.current_status === 'green').length
-          const yellowCount = modelStatuses.filter(m => m.current_status === 'yellow').length
-          const redCount = modelStatuses.filter(m => m.current_status === 'red').length
+        {monitoredModels.length > 0 && theme !== 'minimal' && (() => {
+          const totalRequests = groupedModels.reduce((sum, model) => sum + model.total_requests, 0)
+          const activeModels = groupedModels.filter(model => model.total_requests > 0)
+          const avgRate = activeModels.length > 0 ? +(activeModels.reduce((sum, model) => sum + model.success_rate, 0) / activeModels.length).toFixed(1) : null
+          const { green: greenCount, yellow: yellowCount, red: redCount, empty: emptyCount } = modelStatusCounts(groupedModels)
           return (
             <div className={cn(
               "flex flex-wrap items-center gap-x-6 gap-y-2 mb-6 px-4 py-3 rounded-xl text-sm",
@@ -1143,8 +1044,8 @@ export function ModelStatusEmbed({
                 <span>平均成功率</span>
                 <span className={cn(
                   'font-semibold tabular-nums',
-                  avgRate >= 95 ? styles.statusGreen.replace('bg-', 'text-') : avgRate >= 80 ? styles.statusYellow.replace('bg-', 'text-') : styles.statusRed.replace('bg-', 'text-')
-                )}>{avgRate}%</span>
+                  avgRate === null ? styles.statsText : avgRate >= 95 ? styles.statusGreen.replace('bg-', 'text-') : avgRate >= 80 ? styles.statusYellow.replace('bg-', 'text-') : styles.statusRed.replace('bg-', 'text-')
+                )}>{avgRate === null ? '—' : `${avgRate}%`}</span>
               </div>
               <div className="flex items-center gap-3 ml-auto">
                 <span className="flex items-center gap-1.5">
@@ -1159,22 +1060,17 @@ export function ModelStatusEmbed({
                   <span className={cn('w-2 h-2 rounded-full', styles.statusRed)} />
                   <span className={cn(styles.statsText, 'tabular-nums')}>{redCount}</span>
                 </span>
+                <span className={cn('flex items-center gap-1.5', styles.statsText)}>
+                  <span className={cn('w-2 h-2 rounded-full', styles.statusEmpty)} />
+                  无数据 {emptyCount}
+                </span>
               </div>
             </div>
           )
         })()}
 
         {/* Group Filter Tabs */}
-        {(customGroups.length > 0 || tokenGroups.length > 0) && modelStatuses.length > 0 && theme !== 'minimal' && (() => {
-          // Count models per group
-          const activeModels = modelStatuses.filter(m => m.total_requests > 0)
-          const groupCountMap: Record<string, number> = { all: activeModels.length }
-          customGroups.forEach(g => {
-            groupCountMap[g.id] = activeModels.filter(m => embedModelMatchesGroup(m.model_name, g)).length
-          })
-          tokenGroups.forEach(g => {
-            groupCountMap[`token:${g.group_name}`] = activeModels.filter(m => g.models.includes(m.model_name)).length
-          })
+        {(customGroups.length > 0 || tokenGroups.length > 0) && monitoredModels.length > 0 && theme !== 'minimal' && (() => {
 
           return (
             <div className={cn(
@@ -1258,22 +1154,11 @@ export function ModelStatusEmbed({
         })()}
 
         {/* Model Status Cards */}
-        {modelStatuses.length > 0 ? (
+        {displayedModels.length > 0 ? (
           <div className={cn(
             theme === 'minimal' ? 'divide-y divide-gray-100' : 'grid grid-cols-1 lg:grid-cols-2 gap-4'
           )}>
-            {modelStatuses
-              .filter(model => {
-                if (groupFilter === 'all') return true
-                if (groupFilter.startsWith('token:')) {
-                  const tgName = groupFilter.slice(6)
-                  const tg = tokenGroups.find(g => g.group_name === tgName)
-                  return tg ? tg.models.includes(model.model_name) : true
-                }
-                const group = customGroups.find(g => g.id === groupFilter)
-                return group ? embedModelMatchesGroup(model.model_name, group) : true
-              })
-              .map(model => (
+            {displayedModels.map(model => (
               <EmbedModelCard
                 key={model.model_name}
                 model={model}
@@ -1286,7 +1171,7 @@ export function ModelStatusEmbed({
           </div>
         ) : (
           <div className={cn("text-center py-16", styles.emptyText)}>
-            {selectedModels.length === 0 ? '请在管理界面选择要监控的模型' : '暂无模型状态数据'}
+            {selectedModels.length === 0 ? (syncError ? '模型名单尚未加载' : '请在管理界面选择并保存要监控的模型') : '当前分组下没有已选模型'}
           </div>
         )}
 
@@ -1389,6 +1274,7 @@ function EmbedModelCard({ model, theme, styles, onHover, onLeave }: EmbedModelCa
 
   const timeLabels = getTimeLabels()
   const isMinimal = theme === 'minimal'
+  const hasData = model.total_requests > 0
 
   return (
     <div className={cn(styles.card, styles.cardHover)}>
@@ -1414,19 +1300,19 @@ function EmbedModelCard({ model, theme, styles, onHover, onLeave }: EmbedModelCa
           {!isMinimal && (
             <span className={cn(
               "px-2 py-0.5 text-xs rounded-full font-medium",
-              getBadgeColor(model.current_status, styles)
+              hasData ? getBadgeColor(model.current_status, styles) : cn(styles.statsText, styles.statusEmpty)
             )}>
-              {STATUS_LABELS[model.current_status]}
+              {hasData ? STATUS_LABELS[model.current_status] : '无数据'}
             </span>
           )}
           {isMinimal && (
-            <span className={getBadgeColor(model.current_status, styles)}>
-              {model.current_status === 'green' ? '●' : model.current_status === 'yellow' ? '◐' : '○'}
+            <span className={hasData ? getBadgeColor(model.current_status, styles) : styles.statsText} title={hasData ? STATUS_LABELS[model.current_status] : '无数据'}>
+              {!hasData ? '—' : model.current_status === 'green' ? '●' : model.current_status === 'yellow' ? '◐' : '○'}
             </span>
           )}
         </div>
         <div className={styles.statsText}>
-          <span className={styles.statsValue}>{model.success_rate}%</span>
+          <span className={hasData ? styles.statsValue : styles.statsText}>{hasData ? `${model.success_rate}%` : '—'}</span>
           {!isMinimal && ' 成功率'}
           <span className={isMinimal ? 'mx-1' : 'mx-2 opacity-30'}>·</span>
           <span>{model.total_requests.toLocaleString()}</span>

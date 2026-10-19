@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
@@ -156,10 +157,20 @@ func GetAllModelsStatusHandler(c *gin.Context) {
 	})
 }
 
+func modelStatusReadError(c *gin.Context, code string, err error) {
+	logger.L.Error("model status config read failed: "+err.Error(), logger.CatSystem)
+	c.JSON(http.StatusInternalServerError, models.ErrorResp(code, "读取模型监控配置失败，请稍后重试", ""))
+}
+
 // GET /selected
+// The `data` field is the authoritative manual selection (may legitimately be []).
 func GetSelectedModels(c *gin.Context) {
 	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, err := svc.GetConfig()
+	if err != nil {
+		modelStatusReadError(c, "SELECTION_READ_ERROR", err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":          true,
 		"data":             config["selected_models"],
@@ -173,20 +184,44 @@ func GetSelectedModels(c *gin.Context) {
 	})
 }
 
-// PUT /selected
+// PUT/POST /selected
+// Confirm the authority write and readback before reporting success.
 func SetSelectedModels(c *gin.Context) {
 	var req struct {
-		Models []string `json:"models"`
+		Models []*string `json:"models"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
 		return
 	}
+	if req.Models == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Expected a models array; use [] to clear the selection", ""))
+		return
+	}
+	names := make([]string, len(req.Models))
+	for i, name := range req.Models {
+		if name == nil {
+			c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Expected model names to be strings", ""))
+			return
+		}
+		names[i] = *name
+	}
 	svc := service.NewModelStatusService()
-	svc.SetSelectedModels(req.Models)
+	if err := svc.SetSelectedModels(names); err != nil {
+		logger.L.Error("model selection persist failed: "+err.Error(), logger.CatSystem)
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("SELECTION_SAVE_ERROR", "模型名单保存未确认，请重试", ""))
+		return
+	}
+	// Read the value back from the authority rather than echoing the request,
+	// so the response reflects what a subsequent GET will return.
+	selected, err := svc.GetSelectedModels()
+	if err != nil {
+		modelStatusReadError(c, "SELECTION_READ_ERROR", err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    req.Models,
+		"data":    selected,
 		"message": "Selected models updated",
 	})
 }
@@ -194,7 +229,11 @@ func SetSelectedModels(c *gin.Context) {
 // GET /config/time-window
 func GetTimeWindowConfig(c *gin.Context) {
 	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, err := svc.GetConfig()
+	if err != nil {
+		modelStatusReadError(c, "CONFIG_READ_ERROR", err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":     true,
 		"time_window": config["time_window"],
@@ -234,7 +273,11 @@ func SetTimeWindowConfig(c *gin.Context) {
 // GET /config/theme
 func GetThemeConfig(c *gin.Context) {
 	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, err := svc.GetConfig()
+	if err != nil {
+		modelStatusReadError(c, "CONFIG_READ_ERROR", err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":          true,
 		"theme":            config["theme"],
@@ -279,7 +322,11 @@ func SetThemeConfig(c *gin.Context) {
 // GET /config/refresh-interval
 func GetRefreshIntervalConfig(c *gin.Context) {
 	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, err := svc.GetConfig()
+	if err != nil {
+		modelStatusReadError(c, "CONFIG_READ_ERROR", err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":          true,
 		"refresh_interval": config["refresh_interval"],
@@ -319,7 +366,11 @@ func SetRefreshIntervalConfig(c *gin.Context) {
 // GET /config/sort-mode
 func GetSortModeConfig(c *gin.Context) {
 	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, err := svc.GetConfig()
+	if err != nil {
+		modelStatusReadError(c, "CONFIG_READ_ERROR", err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
 		"sort_mode": config["sort_mode"],
@@ -374,10 +425,15 @@ func SetCustomOrderConfig(c *gin.Context) {
 	})
 }
 
-// GET /config (embed)
+// GET /config (embed, public)
+// Read failures are not an empty published selection.
 func GetEmbedConfig(c *gin.Context) {
 	svc := service.NewModelStatusService()
-	config := svc.GetEmbedConfig()
+	config, err := svc.GetEmbedConfig()
+	if err != nil {
+		modelStatusReadError(c, "CONFIG_READ_ERROR", err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": config})
 }
 

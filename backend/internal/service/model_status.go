@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/new-api-tools/backend/internal/cache"
@@ -14,7 +15,7 @@ import (
 var (
 	AvailableTimeWindows = []string{"1h", "6h", "12h", "24h"}
 	DefaultTimeWindow    = "24h"
-	AvailableThemes = []string{
+	AvailableThemes      = []string{
 		"daylight", "obsidian", "minimal", "neon", "forest", "ocean", "terminal",
 		"cupertino", "material", "openai", "anthropic", "vercel", "linear",
 		"stripe", "github", "discord", "tesla",
@@ -404,25 +405,51 @@ func (s *ModelStatusService) getGroupCol() string {
 
 // Config management via cache
 
-// GetSelectedModels returns selected model names from cache
-func (s *ModelStatusService) GetSelectedModels() []string {
+// The manual selection is shared by the admin and public pages, never inferred from traffic.
+const selectedModelsCacheKey = "model_status:selected_models"
+
+// normalizeSelectedModels trims, drops empties and de-duplicates while
+// preserving the order the operator picked. An empty (or nil) list is legal and
+// means "nothing is published" — it is never replaced by any inferred list.
+func normalizeSelectedModels(models []string) []string {
+	out := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, m := range models {
+		name := strings.TrimSpace(m)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+// GetSelectedModels reads the same authority for both pages. Read failures must
+// not be mistaken for a deliberately empty selection.
+func (s *ModelStatusService) GetSelectedModels() ([]string, error) {
 	cm := cache.Get()
 	var models []string
-	found, _ := cm.GetJSON("model_status:selected_models", &models)
-	if found {
-		return models
+	if found, err := cm.GetAuthoritativeJSON(selectedModelsCacheKey, &models); err != nil {
+		return nil, err
+	} else if !found {
+		return []string{}, nil
 	}
-	return []string{}
+	return normalizeSelectedModels(models), nil
 }
 
-// SetSelectedModels saves selected models to cache
-func (s *ModelStatusService) SetSelectedModels(models []string) {
-	cm := cache.Get()
-	cm.Set("model_status:selected_models", models, 0) // no expiry
+// SetSelectedModels confirms the store write before reporting success.
+// Without Redis, the existing in-process mode is not durable across restarts.
+func (s *ModelStatusService) SetSelectedModels(models []string) error {
+	// Normalization always produces a non-nil slice, including an empty selection.
+	return cache.Get().SetAuthoritative(selectedModelsCacheKey, normalizeSelectedModels(models), 0)
 }
 
-// GetConfig returns all model status config
-func (s *ModelStatusService) GetConfig() map[string]interface{} {
+// GetConfig returns all model status config, propagating selection read failures.
+func (s *ModelStatusService) GetConfig() (map[string]interface{}, error) {
 	cm := cache.Get()
 
 	var timeWindow string
@@ -462,16 +489,22 @@ func (s *ModelStatusService) GetConfig() map[string]interface{} {
 		customGroups = []map[string]interface{}{}
 	}
 
+	// Same authority for the admin read, the embed read and the public page.
+	selected, err := s.GetSelectedModels()
+	if err != nil {
+		return nil, err
+	}
+
 	return map[string]interface{}{
 		"time_window":      timeWindow,
 		"theme":            theme,
 		"refresh_interval": refreshInterval,
 		"sort_mode":        sortMode,
 		"custom_order":     customOrder,
-		"selected_models":  s.GetSelectedModels(),
+		"selected_models":  selected,
 		"custom_groups":    customGroups,
 		"site_title":       s.GetSiteTitle(),
-	}
+	}, nil
 }
 
 // SetTimeWindow saves time window to cache
@@ -538,12 +571,15 @@ func (s *ModelStatusService) SetSiteTitle(title string) {
 	cm.Set("model_status:site_title", title, 0)
 }
 
-// GetEmbedConfig returns embed page configuration
-func (s *ModelStatusService) GetEmbedConfig() map[string]interface{} {
-	config := s.GetConfig()
+// GetEmbedConfig returns embed configuration using the same selection authority.
+func (s *ModelStatusService) GetEmbedConfig() (map[string]interface{}, error) {
+	config, err := s.GetConfig()
+	if err != nil {
+		return nil, err
+	}
 	config["available_time_windows"] = AvailableTimeWindows
 	config["available_themes"] = AvailableThemes
 	config["available_refresh_intervals"] = AvailableRefreshIntervals
 	config["available_sort_modes"] = AvailableSortModes
-	return config
+	return config, nil
 }

@@ -109,6 +109,11 @@ func Get() *Manager {
 // All operations on it are safe no-ops (rdb is nil, methods check for it).
 var noop = Manager{}
 
+// SetForTesting replaces the global manager; nil restores the in-process mode.
+func SetForTesting(m *Manager) {
+	mgr = m
+}
+
 // Close closes the Redis connection
 func Close() error {
 	if mgr != nil && mgr.rdb != nil {
@@ -144,6 +149,87 @@ func (m *Manager) Set(key string, value interface{}, ttl time.Duration) error {
 		return nil
 	}
 	return m.rdb.Set(m.ctx, key, data, ttl).Err()
+}
+
+// Bound the local mirror for legacy readers; authoritative reads always use Redis.
+const localStoreTTL = 30 * time.Second
+
+// storeLocal caches pre-serialized bytes locally.
+// ttl <= 0 means the local entry never expires.
+func (m *Manager) storeLocal(key string, data []byte, ttl time.Duration) {
+	entry := &localEntry{data: data}
+	if ttl > 0 {
+		entry.expiresAt = time.Now().Add(ttl)
+	}
+	m.localCache.Store(key, entry)
+}
+
+// getLocalJSON reads the local authority when no shared store is configured.
+func (m *Manager) getLocalJSON(key string, dest interface{}) (bool, error) {
+	val, ok := m.localCache.Load(key)
+	if !ok {
+		atomic.AddInt64(&m.misses, 1)
+		return false, nil
+	}
+	entry, ok := val.(*localEntry)
+	if !ok || entry.isExpired() {
+		m.localCache.Delete(key)
+		atomic.AddInt64(&m.misses, 1)
+		return false, nil
+	}
+	atomic.AddInt64(&m.hits, 1)
+	return true, json.Unmarshal(entry.data, dest)
+}
+
+// SetAuthoritative writes Redis before publishing a local mirror. A failed write
+// is not confirmed and must not publish a local-only value. Without Redis, data
+// is held in this process only and is lost on restart.
+func (m *Manager) SetAuthoritative(key string, value interface{}, ttl time.Duration) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("failed to serialize cache value: %w", err)
+	}
+	if m.rdb == nil {
+		m.storeLocal(key, data, ttl)
+		return nil
+	}
+
+	if err := m.rdb.Set(m.ctx, key, data, ttl).Err(); err != nil {
+		m.localCache.Delete(key)
+		return fmt.Errorf("shared cache write failed for %s: %w", key, err)
+	}
+	m.storeLocal(key, data, localStoreTTL)
+	return nil
+}
+
+// GetAuthoritativeJSON reads a value whose authority is the shared store.
+//
+// When a shared store is configured it is always consulted, and the local entry
+// is only a short-lived mirror of it. A miss in the shared store deletes the
+// local mirror so a previously cached value cannot shadow "not set".
+//
+// When no shared store is configured it reads the local map only (in-process
+// mode) and returns (false, nil) when the key was never stored.
+func (m *Manager) GetAuthoritativeJSON(key string, dest interface{}) (bool, error) {
+	if m.rdb == nil {
+		return m.getLocalJSON(key, dest)
+	}
+
+	data, err := m.rdb.Get(m.ctx, key).Bytes()
+	if err == redis.Nil {
+		// The shared store is authoritative: absent there means "not set",
+		// so a stale local mirror must not be served instead.
+		m.localCache.Delete(key)
+		atomic.AddInt64(&m.misses, 1)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("shared cache read failed for %s: %w", key, err)
+	}
+
+	m.storeLocal(key, data, localStoreTTL)
+	atomic.AddInt64(&m.hits, 1)
+	return true, json.Unmarshal(data, dest)
 }
 
 // GetJSON retrieves and deserializes a value from cache
